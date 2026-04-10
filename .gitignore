@@ -1,3 +1,9 @@
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
