@@ -1,0 +1,61 @@
+# Open-ASR Model Explorer – Docker Compose
+# Usage:
+#   docker compose up --build          # start both services
+#   docker compose up --build backend  # backend only
+#   docker compose down -v             # stop and remove volumes
+#
+# The frontend is served by Nginx on http://localhost:3000.
+# The backend FastAPI API is available directly on http://localhost:8000.
+# Nginx proxies /api/* → http://backend:8000/* so the UI calls /api/… .
+
+services:
+
+  # ── FastAPI + vLLM backend ──────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist downloaded HuggingFace model weights across container restarts.
+      - hf_cache:/hf_cache
+    environment:
+      - HF_HOME=/hf_cache
+      - TRANSFORMERS_CACHE=/hf_cache
+      # Uncomment and set HF_TOKEN if you access gated models on HuggingFace
+      # (e.g. Cohere-transcribe-03-2026 or IBM Granite may require acceptance
+      # of model terms before download).
+      # - HF_TOKEN=${HF_TOKEN}
+    # GPU access – requires the NVIDIA Container Toolkit.
+    # Remove the `deploy` block entirely if running CPU-only.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ── React / Nginx frontend ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # Named volume for HuggingFace model weight cache.
+  hf_cache:
