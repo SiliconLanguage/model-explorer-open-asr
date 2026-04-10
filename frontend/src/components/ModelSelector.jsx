@@ -10,6 +10,7 @@ const MODELS = [
   { id: 'Qwen3-ASR-1.7B',                     label: 'Qwen3-ASR 1.7B',                     mode: 'server' },
   { id: 'ibm-granite/granite-4.0-1b-speech',  label: 'IBM Granite 4.0 1B Speech',          mode: 'server' },
   { id: 'Cohere-Transcribe-WebGPU',           label: 'Cohere Transcribe (WebGPU)',          mode: 'webgpu' },
+  { id: 'Whisper-Large-v3-Turbo-WebGPU',      label: 'Whisper Large v3 Turbo (WebGPU)',    mode: 'webgpu' },
 ];
 
 const BADGE = {

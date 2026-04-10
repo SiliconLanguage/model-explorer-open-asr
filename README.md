@@ -1,3 +1,13 @@
+---
+title: Open-ASR Model Explorer
+emoji: 🎙
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # Open-ASR Model Explorer
 
 [![Deploy to Hugging Face Spaces](https://img.shields.io/badge/🤗%20Deploy-Hugging%20Face%20Spaces-orange?style=for-the-badge)](https://huggingface.co/spaces)
@@ -63,6 +73,7 @@ A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qw
 | `Qwen3-ASR-1.7B` | **Server (vLLM)** | Routes to FastAPI backend |
 | `ibm-granite/granite-4.0-1b-speech` | **Server (vLLM)** | Routes to FastAPI backend |
 | `Cohere-Transcribe-WebGPU` | **Client (WebGPU)** | Runs in-browser via transformers.js |
+| `Whisper-Large-v3-Turbo-WebGPU` | **Client (WebGPU)** | Whisper Large v3 Turbo in-browser via transformers.js |
 
 ### WebGPU Client-Side Features
 - **Zero-server transcription** – audio never leaves the browser
@@ -80,11 +91,14 @@ A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qw
 
 ```
 model-explorer-open-asr/
+├── docker-compose.yml     # Full-stack orchestration (backend + frontend)
 ├── backend/
 │   ├── app.py             # FastAPI application with vLLM integration
 │   ├── requirements.txt   # Python dependencies
 │   └── Dockerfile         # CUDA 12.1 container image
 └── frontend/
+    ├── Dockerfile         # Multi-stage Vite build → Nginx serve
+    ├── nginx.conf         # Nginx: API proxy + SSE streaming + SPA fallback
     ├── index.html
     ├── package.json
     ├── vite.config.js
@@ -166,7 +180,7 @@ docker run --gpus all -p 8000:8000 \
 docker compose up --build
 ```
 
-> **Note:** A `docker-compose.yml` can be added to orchestrate frontend (nginx) + backend containers together.
+The UI will be available at `http://localhost:3000` and the API at `http://localhost:8000`.
 
 ---
 

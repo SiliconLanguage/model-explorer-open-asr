@@ -27,7 +27,9 @@ import { pipeline, env } from '@xenova/transformers';
 // ── Cache configuration ───────────────────────────────────────────────────────
 // Point transformers.js at the Cache Storage API so ONNX weights survive
 // page reloads without re-downloading from the CDN.
-env.useBrowserCache = true;
+// useBrowserCache relies on the Cache Storage API which is only available in
+// secure contexts (HTTPS or localhost); it is a no-op if the API is absent.
+env.useBrowserCache = typeof caches !== 'undefined';
 env.allowLocalModels = false;
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -70,10 +72,16 @@ class LocalAgreement2 {
    */
   update(current) {
     const agreed = longestCommonPrefix(this.prev, current);
-    // Extend the stable set with newly confirmed tokens
-    if (agreed.length > this.stableTokens.length) {
-      this.stableTokens = agreed;
-    }
+    // Extend the stable set with newly confirmed tokens, but never claim more
+    // stable tokens than actually exist in the current hypothesis.  Capping at
+    // current.length prevents stale over-commitment when the model produces a
+    // shorter hypothesis (e.g. at the start of a new audio chunk), which would
+    // otherwise show confirmed text that is no longer in the active hypothesis.
+    const newStableLen = Math.min(
+      Math.max(agreed.length, this.stableTokens.length),
+      current.length,
+    );
+    this.stableTokens = current.slice(0, newStableLen);
     this.prev = current;
     const stable = this.stableTokens.join('');
     const unstable = current.slice(this.stableTokens.length).join('');
@@ -94,14 +102,27 @@ async function loadModel(modelId) {
   }
   try {
     self.postMessage({ type: 'loading', modelId });
-    asr = await pipeline('automatic-speech-recognition', modelId, {
-      // Request WebGPU execution provider; falls back to WASM if unavailable
-      device: 'webgpu',
-      dtype: 'fp16',
-    });
+    try {
+      // Prefer WebGPU (fp16) for maximum throughput.
+      asr = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'webgpu',
+        dtype: 'fp16',
+      });
+    } catch {
+      // WebGPU unavailable (non-secure context, old browser, no GPU) –
+      // fall back to WASM fp32 so the app still works.
+      self.postMessage({ type: 'loading', modelId, fallback: 'wasm' });
+      asr = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'wasm',
+        dtype: 'fp32',
+      });
+    }
     loadedModelId = modelId;
     self.postMessage({ type: 'ready' });
   } catch (err) {
+    // Reset state so a subsequent load attempt can retry cleanly.
+    asr = null;
+    loadedModelId = null;
     self.postMessage({ type: 'error', id: null, message: String(err) });
   }
 }

@@ -15,6 +15,7 @@
 
 let workerInstance = null;
 let workerReadyResolve = null;
+let workerReadyReject = null;  // companion reject for the load promise
 const pendingCallbacks = new Map(); // id → { resolve, reject, onProgress }
 
 function getWorker() {
@@ -29,12 +30,25 @@ function getWorker() {
   workerInstance.addEventListener('message', (event) => {
     const { type, id, stable, unstable, transcript, ttft_ms, itl_ms, rtfx, message } = event.data;
 
+    // ── Load lifecycle messages ─────────────────────────────────────────────
     if (type === 'ready' && workerReadyResolve) {
-      workerReadyResolve();
+      const res = workerReadyResolve;
       workerReadyResolve = null;
+      workerReadyReject = null;
+      res();
       return;
     }
 
+    // A null id means the error came from loadModel(), not a transcription.
+    if (type === 'error' && id == null) {
+      const rej = workerReadyReject;
+      workerReadyResolve = null;
+      workerReadyReject = null;
+      rej?.(new Error(message ?? 'Model failed to load'));
+      return;
+    }
+
+    // ── Transcription lifecycle messages ────────────────────────────────────
     const cb = pendingCallbacks.get(id);
     if (!cb) return;
 
@@ -58,8 +72,9 @@ function getWorker() {
 
 async function ensureModelLoaded(modelId) {
   const worker = getWorker();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     workerReadyResolve = resolve;
+    workerReadyReject = reject;
     worker.postMessage({ type: 'load', model: modelId });
   });
 }
@@ -97,31 +112,38 @@ async function routeServer(modelId, audioFile, onProgress) {
   let buffer = '';
   let finalResult = null;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    // Parse Server-Sent Events
-    const events = buffer.split('\n\n');
-    buffer = events.pop() ?? '';
+      // Parse Server-Sent Events
+      const events = buffer.split('\n\n');
+      buffer = events.pop() ?? '';
 
-    for (const event of events) {
-      const dataLine = event.split('\n').find((l) => l.startsWith('data: '));
-      if (!dataLine) continue;
-      try {
-        const payload = JSON.parse(dataLine.slice(6));
-        if (payload.done) {
-          finalResult = payload;
-        } else if (payload.token) {
-          onProgress?.({ token: payload.token, ttft_ms: payload.ttft_ms });
-        } else if (payload.ttft_ms != null) {
-          onProgress?.({ ttft_ms: payload.ttft_ms });
+      for (const event of events) {
+        const dataLine = event.split('\n').find((l) => l.startsWith('data: '));
+        if (!dataLine) continue;
+        try {
+          const payload = JSON.parse(dataLine.slice(6));
+          if (payload.done) {
+            finalResult = payload;
+          } else if (payload.token) {
+            onProgress?.({ token: payload.token, ttft_ms: payload.ttft_ms });
+          } else if (payload.ttft_ms != null) {
+            onProgress?.({ ttft_ms: payload.ttft_ms });
+          }
+        } catch {
+          // ignore malformed SSE frames
         }
-      } catch {
-        // ignore malformed SSE frames
       }
     }
+  } finally {
+    // Always release the reader so the underlying HTTP connection can be
+    // returned to the pool.  This prevents stream leaks when an exception
+    // is thrown mid-stream (e.g. network error or component unmount).
+    reader.cancel();
   }
 
   if (!finalResult) throw new Error('Stream ended without a final result.');
