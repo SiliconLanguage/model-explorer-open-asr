@@ -36,17 +36,6 @@ COPY requirements.txt .
 RUN /opt/venv/bin/pip install --no-cache-dir --upgrade "pip<26" \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# ── Patch vLLM attention backend priorities for Blackwell (SM 12.0) ──────────
-# FlashAttention 2 segfaults during encoder cache profiling on SM 12.0 because
-# the bundled CUDA 12.1 toolkit predates the Blackwell architecture.  Swap the
-# priority so FlashInfer (main attn) and TORCH_SDPA (vit/encoder attn) are
-# tried first; FLASH_ATTN becomes a last resort.
-COPY patch_vllm_blackwell.py /tmp/patch_vllm_blackwell.py
-RUN python /tmp/patch_vllm_blackwell.py \
-    && find /opt/venv -path '*/vllm/platforms/__pycache__' -exec rm -rf {} + 2>/dev/null \
-    && rm /tmp/patch_vllm_blackwell.py \
-    || true
-
 # ── Copy application source ───────────────────────────────────────────────────
 COPY app.py .
 

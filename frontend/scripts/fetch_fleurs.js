@@ -11,6 +11,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const outDir = path.join(path.dirname(new URL(import.meta.url).pathname), '../public/samples');
 if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
@@ -19,12 +20,22 @@ const FLEURS_CONFIGS = {
   english: 'en_us',
   chinese: 'cmn_hans_cn',
   spanish: 'es_419',
+  french: 'fr_fr',
+  german: 'de_de',
+  italian: 'it_it',
+  japanese: 'ja_jp',
+  hindi: 'hi_in',
 };
 
 const FALLBACK_SOURCES = {
   english: { dataset: 'MLCommons/peoples_speech', config: 'clean', split: 'train' },
   chinese: { dataset: 'PolyAI/minds14', config: 'zh-CN', split: 'train' },
   spanish: { dataset: 'facebook/multilingual_librispeech', config: 'spanish', split: 'test' },
+  french: { dataset: 'facebook/multilingual_librispeech', config: 'french', split: 'test' },
+  german: { dataset: 'facebook/multilingual_librispeech', config: 'german', split: 'test' },
+  italian: { dataset: 'facebook/multilingual_librispeech', config: 'italian', split: 'test' },
+  japanese: { dataset: 'PolyAI/minds14', config: 'ja-JP', split: 'train' },
+  hindi: { dataset: 'PolyAI/minds14', config: 'hi-IN', split: 'train' },
 };
 
 async function fetchFromDatasetServer(dataset, config, split) {
@@ -44,6 +55,24 @@ async function fetchFromDatasetServer(dataset, config, split) {
   return Buffer.from(await audioRes.arrayBuffer());
 }
 
+/**
+ * If the downloaded file is not WAV (e.g. OGG from FLEURS/MLS), convert it
+ * to 16 kHz mono WAV using ffmpeg so the browser <audio> element can always
+ * play it without MIME-type mismatches.
+ */
+function ensureWav(filePath) {
+  const header = Buffer.alloc(4);
+  const fd = fs.openSync(filePath, 'r');
+  fs.readSync(fd, header, 0, 4, 0);
+  fs.closeSync(fd);
+  if (header.toString('ascii', 0, 4) === 'RIFF') return; // already WAV
+
+  console.log('  Converting to WAV (16 kHz mono)...');
+  const tmp = filePath + '.tmp.wav';
+  execFileSync('ffmpeg', ['-y', '-i', filePath, '-ar', '16000', '-ac', '1', '-f', 'wav', tmp], { stdio: 'ignore' });
+  fs.renameSync(tmp, filePath);
+}
+
 async function fetchSamples() {
   for (const [name, fleursConfig] of Object.entries(FLEURS_CONFIGS)) {
     const outPath = path.join(outDir, `${name}.wav`);
@@ -52,7 +81,8 @@ async function fetchSamples() {
     try {
       const buf = await fetchFromDatasetServer('google/fleurs', fleursConfig, 'validation');
       fs.writeFileSync(outPath, buf);
-      console.log(`  Done: google/fleurs (${buf.length} bytes)`);
+      ensureWav(outPath);
+      console.log(`  Done: google/fleurs (${fs.statSync(outPath).size} bytes)`);
       continue;
     } catch (err) {
       console.warn(`  FLEURS unavailable: ${err.message}`);
@@ -63,7 +93,8 @@ async function fetchSamples() {
     try {
       const buf = await fetchFromDatasetServer(fb.dataset, fb.config, fb.split);
       fs.writeFileSync(outPath, buf);
-      console.log(`  Done: ${fb.dataset} (${buf.length} bytes)`);
+      ensureWav(outPath);
+      console.log(`  Done: ${fb.dataset} (${fs.statSync(outPath).size} bytes)`);
     } catch (err) {
       console.error(`  Fallback also failed: ${err.message}`);
       process.exit(1);

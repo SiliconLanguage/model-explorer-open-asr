@@ -22,6 +22,7 @@ export default function App() {
   const [modelValue, setModelValue] = useState('cohere-hf-gpu');
   const [audioFile, setAudioFile] = useState(null);
   const [audioUrl, setAudioUrl] = useState(null);
+  const [selectedLanguage, setSelectedLanguage] = useState('english');
   const [status, setStatus] = useState('idle'); // idle | loading | streaming | done | error
   const [errorMsg, setErrorMsg] = useState(null);
 
@@ -35,6 +36,10 @@ export default function App() {
 
   const abortRef = useRef(false);
   const selectedModel = getModelByValue(modelValue);
+  // Short model key for VRAM map lookup (strip org prefix, -ONNX suffix, lowercase)
+  const modelKey = selectedModel?.id
+    ? selectedModel.id.split('/').pop().replace(/-ONNX$/i, '').toLowerCase()
+    : '';
 
   const isRunning = status === 'loading' || status === 'streaming';
 
@@ -81,7 +86,7 @@ export default function App() {
     setTranscribeMode(null);
 
     try {
-      const result = await route(selectedModel.id, audioFile, handleProgress, selectedModel.engine, selectedModel.mode);
+      const result = await route(selectedModel.id, audioFile, handleProgress, selectedModel.engine, selectedModel.mode, selectedLanguage);
 
       if (abortRef.current) return;
 
@@ -138,7 +143,7 @@ export default function App() {
           <section className="section">
             <h2 className="section-title">Audio Input</h2>
             <AudioRecorder onAudioReady={setAudioFile} disabled={isRunning} externalAudioUrl={audioUrl} />
-            <SampleClips onSampleSelect={setAudioFile} disabled={isRunning} />
+            <SampleClips onSampleSelect={(file, lang) => { setAudioFile(file); if (lang) setSelectedLanguage(lang); }} disabled={isRunning} />
           </section>
 
           {/* ── Action buttons ─────────────────────────────────────────── */}
@@ -197,7 +202,11 @@ export default function App() {
         {/* ── Metrics dashboard ─────────────────────────────────────── */}
         {(metrics || status === 'done') && (
           <div className="card">
-            <MetricsDashboard metrics={metrics} mode={transcribeMode} />
+            <MetricsDashboard
+              metrics={metrics}
+              engine={selectedModel?.mode === 'webgpu' ? 'webgpu' : (selectedModel?.engine ?? 'server')}
+              model={modelKey}
+            />
           </div>
         )}
       </main>

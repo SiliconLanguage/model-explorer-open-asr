@@ -85,24 +85,27 @@ async function ensureModelLoaded(modelId) {
   });
 }
 
-async function routeWebGPU(modelId, audioBuffer, onProgress) {
+async function routeWebGPU(modelId, audioBuffer, onProgress, language) {
   await ensureModelLoaded(modelId);
   const worker = getWorker();
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     pendingCallbacks.set(id, { resolve, reject, onProgress });
-    worker.postMessage({ type: 'transcribe', audio: audioBuffer, id }, [audioBuffer.buffer]);
+    worker.postMessage({ type: 'transcribe', audio: audioBuffer, id, language }, [audioBuffer.buffer]);
   });
 }
 
 // ── Server-side / vLLM client ─────────────────────────────────────────────────
 
-async function routeServer(modelId, audioFile, onProgress, engine) {
+async function routeServer(modelId, audioFile, onProgress, engine, language) {
   const form = new FormData();
   form.append('audio', audioFile);
   form.append('model', modelId);
   if (engine) {
     form.append('engine', engine);
+  }
+  if (language) {
+    form.append('language', language);
   }
 
   // Use streaming endpoint for token-by-token delivery
@@ -176,14 +179,14 @@ async function routeServer(modelId, audioFile, onProgress, engine) {
  * @param {function} [onProgress] Called with partial results during streaming
  * @returns {Promise<{transcript:string, ttft_ms:number, itl_ms:number, rtfx:number, mode:string}>}
  */
-export async function route(modelId, audio, onProgress, engine = undefined, mode = 'server') {
+export async function route(modelId, audio, onProgress, engine = undefined, mode = 'server', language = undefined) {
   if (mode === 'webgpu') {
     // Ensure we have a Float32Array of 16 kHz samples
     const audioBuffer = audio instanceof Float32Array ? audio : await fileToFloat32(audio);
-    return routeWebGPU(modelId, audioBuffer, onProgress);
+    return routeWebGPU(modelId, audioBuffer, onProgress, language);
   }
   // Server-side: pass the raw File for multipart upload
-  return routeServer(modelId, audio, onProgress, engine);
+  return routeServer(modelId, audio, onProgress, engine, language);
 }
 
 // ── Helper: decode File → Float32Array at 16 kHz ──────────────────────────────

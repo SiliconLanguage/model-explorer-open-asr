@@ -14,7 +14,7 @@ pinned: false
 [![Python](https://img.shields.io/badge/Python-3.11-blue?style=for-the-badge&logo=python)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.120-green?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react)](https://react.dev)
-[![vLLM](https://img.shields.io/badge/vLLM-0.18-purple?style=for-the-badge)](https://vllm.ai)
+[![vLLM](https://img.shields.io/badge/vLLM-0.19-purple?style=for-the-badge)](https://vllm.ai)
 
 A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qwen3-ASR, IBM Granite) featuring vLLM server-side routing and transformers.js WebGPU client-side inference.
 
@@ -110,11 +110,12 @@ When infrastructure or documentation changes, follow this protocol:
 
 | Model | Execution Mode | Description |
 |---|---|---|
-| `Cohere-transcribe-03-2026` | **Server (vLLM)** | Routes to FastAPI backend |
-| `Qwen3-ASR-1.7B` | **Server (vLLM)** | Routes to FastAPI backend |
-| `ibm-granite/granite-4.0-1b-speech` | **Server (vLLM)** | Routes to FastAPI backend |
-| `Cohere-Transcribe-WebGPU` | **Client (WebGPU)** | Runs in-browser via transformers.js |
-| `Whisper-Large-v3-Turbo-WebGPU` | **Client (WebGPU)** | Whisper Large v3 Turbo in-browser via transformers.js |
+| `openai/whisper-base` | **Server (HF-GPU / HF-CPU)** | Standard HF transformers pipeline |
+| `CohereLabs/cohere-transcribe-03-2026` | **Server (HF-GPU / HF-CPU)** | Custom model wrapper (`trust_remote_code`) |
+| `Qwen3-ASR-1.7B` | **Server (HF-GPU)** | Via `qwen-asr` package (architecture not in transformers) |
+| `ibm-granite/granite-4.0-1b-speech` | **Server (HF-GPU / vLLM Cloud)** | Chat-template + `<\|audio\|>` multimodal wrapper |
+| `Xenova/whisper-tiny` / `Xenova/whisper-base` | **Client (WebGPU)** | Runs in-browser via transformers.js ONNX |
+| `onnx-community/cohere-transcribe-03-2026-ONNX` | **Client (WebGPU)** | Cohere in-browser via transformers.js ONNX |
 
 ### WebGPU Client-Side Features
 - **Zero-server transcription** – audio never leaves the browser
@@ -124,7 +125,19 @@ When infrastructure or documentation changes, follow this protocol:
 ### Backend vLLM Configuration
 - **Chunked Prefill** – `enable_chunked_prefill=True` prevents long audio prefills from starving decode steps
 - **Pre-batching normalisation** – all audio padded/truncated to 30 s before entering the scheduler
-- **Resource constraints** – `max_num_batched_tokens=2048`, env-driven `gpu_memory_utilization`, env-driven `max_model_len`
+- **Resource constraints** – `max_num_batched_tokens=512`, env-driven `gpu_memory_utilization`, auto-derived `max_model_len`
+
+### Hardware Constraints: vLLM on SM 12.0 (Blackwell)
+
+> **Affects:** Local development on NVIDIA RTX 5070 Ti and other SM 12.0 (Blackwell) GPUs.
+
+**The Issue.** While vLLM 0.19.0 is the target production engine, running it locally on SM 12.0 hardware fails due to an upstream `ir.builder` NULL-dereference bug in the bundled Triton 3.6.0 compiler. This crashes all native attention kernels — FlashAttention 2, FlashInfer 0.6.6, and every Triton-based backend (TRITON_ATTN, FLEX_ATTENTION). The NVFP4 kernel guard patches in vLLM 0.19.0 (PR #38423, #38126) address quantization paths but do not fix the attention backend segfaults.
+
+**Graceful Degradation.** The testbed handles this without crashing. When a vLLM route is requested on unsupported local hardware, the backend returns `503 Service Unavailable` with a descriptive message. Users should select an **HF-GPU** variant from the model dropdown to process audio via the standard Hugging Face transformers pipeline, which uses native PyTorch CUDA primitives and runs reliably on SM 12.0.
+
+**Future Resolution.** Once Triton ≥ 3.6.1 ships with the `ir.builder` fix and is bundled into a future vLLM release, the local SM 12.0 constraint will be lifted and vLLM will serve as the primary engine on all hardware.
+
+For the full architectural decision record, see [ADR-001: vLLM vs. Hugging Face Inference Routing](https://github.com/SiliconLanguage/model-explorer-open-asr-AgentWiki/blob/main/Architecture/ADR-001-vLLM_Constraints.md).
 
 ---
 
@@ -136,7 +149,7 @@ model-explorer-open-asr/
 ├── backend/
 │   ├── app.py             # FastAPI application with vLLM integration
 │   ├── requirements.txt   # Python dependencies
-│   └── Dockerfile         # CUDA 12.1 container image
+│   └── Dockerfile         # CUDA 12.8 container image (Blackwell-compatible)
 └── frontend/
     ├── Dockerfile         # Multi-stage Vite build → Nginx serve
     ├── nginx.conf         # Nginx: API proxy + SSE streaming + SPA fallback

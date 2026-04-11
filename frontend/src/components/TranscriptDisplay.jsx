@@ -20,11 +20,6 @@ export default function TranscriptDisplay({ stable, unstable, loading, mode }) {
     <div className="transcript-display">
       <div className="transcript-header">
         <span className="transcript-title">Transcript</span>
-        {mode && (
-          <span className="transcript-mode">
-            {mode === 'webgpu' ? '🔒 Local (WebGPU)' : '☁️ Server (vLLM)'}
-          </span>
-        )}
       </div>
 
       <div className="transcript-body transcript-output" aria-live="polite" aria-label="Transcription output">

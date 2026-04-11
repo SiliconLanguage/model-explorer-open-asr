@@ -38,6 +38,17 @@ let asr = null;
 let loadedModelId = null;
 const abortedIds = new Set();
 
+const LANGUAGE_ISO_MAP = {
+  english: 'en',
+  chinese: 'zh',
+  spanish: 'es',
+  french: 'fr',
+  german: 'de',
+  italian: 'it',
+  japanese: 'ja',
+  hindi: 'hi',
+};
+
 // ── LocalAgreement-2 helpers ──────────────────────────────────────────────────
 /**
  * Returns the longest common prefix (token-level) shared by *a* and *b*.
@@ -101,12 +112,25 @@ async function loadModel(modelId) {
     return;
   }
   try {
+    // Dispose of the previous pipeline's ONNX sessions before loading a new
+    // model.  Without this, ONNX Runtime tries to .destroy() GPU buffers that
+    // were already garbage-collected, throwing "Cannot read properties of
+    // undefined (reading 'destroy')".
+    if (asr) {
+      try { await asr.dispose(); } catch { /* best-effort cleanup */ }
+      asr = null;
+      loadedModelId = null;
+    }
+
     self.postMessage({ type: 'loading', modelId });
+    // Cohere 2B encoder fp16 has 2 external data shards (~2.5 GB) which
+    // exceeds browser memory limits.  Use q4f16 (1 shard, ~600 MB) instead.
+    const isCohere = modelId.toLowerCase().includes('cohere');
+    const gpuDtype = isCohere ? 'q4f16' : 'fp16';
     try {
-      // Prefer WebGPU (fp16) for maximum throughput.
       asr = await pipeline('automatic-speech-recognition', modelId, {
         device: 'webgpu',
-        dtype: 'fp16',
+        dtype: gpuDtype,
       });
     } catch {
       // WebGPU unavailable (non-secure context, old browser, no GPU) –
@@ -114,7 +138,7 @@ async function loadModel(modelId) {
       self.postMessage({ type: 'loading', modelId, fallback: 'wasm' });
       asr = await pipeline('automatic-speech-recognition', modelId, {
         device: 'wasm',
-        dtype: 'fp32',
+        dtype: isCohere ? 'q4' : 'fp32',
       });
     }
     loadedModelId = modelId;
@@ -128,12 +152,13 @@ async function loadModel(modelId) {
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
-async function transcribe(audio, id) {
+async function transcribe(audio, id, language) {
   if (!asr) {
     self.postMessage({ type: 'error', id, message: 'Model not loaded. Send a load message first.' });
     return;
   }
 
+  const isoLang = language ? (LANGUAGE_ISO_MAP[language.toLowerCase()] || 'en') : undefined;
   const la2 = new LocalAgreement2();
   const t0 = performance.now();
   let firstTokenTime = null;
@@ -141,11 +166,33 @@ async function transcribe(audio, id) {
 
   try {
     // transformers.js callback_function fires after each generated token
+    // Whisper models support chunked long-form decoding; Cohere uses its own
+    // encoder and these params cause early truncation.
+    const isWhisper = (loadedModelId ?? '').toLowerCase().includes('whisper');
+
+    // Non-Whisper models (e.g. Cohere ONNX) default to max_length=20 in
+    // GenerationConfig, truncating transcripts to ~10 new tokens.  Force a
+    // generous limit via BOTH max_new_tokens AND generation_config to ensure
+    // at least one path overrides the default.
+    const cohereGenerationOverrides = !isWhisper
+      ? { max_new_tokens: 512, max_length: 1024, generation_config: { max_new_tokens: 512, max_length: 1024 } }
+      : {};
+
     const result = await asr(audio, {
       task: 'transcribe',
-      return_timestamps: true,
-      chunk_length_s: 30,
-      stride_length_s: 5,
+      ...(isoLang ? { language: isoLang } : {}),
+      // Whisper: chunked long-form decoding with timestamp grounding.
+      // return_timestamps forces the attention mechanism to anchor to audio
+      // frames, naturally cutting off silence loops without draconian n-gram
+      // penalties that truncate valid speech.
+      ...(isWhisper ? {
+        return_timestamps: true,
+        chunk_length_s: 30,
+        stride_length_s: 5,
+        repetition_penalty: 1.05,
+        condition_on_prev_tokens: false,
+      } : {}),
+      ...cohereGenerationOverrides,
       callback_function: (beams) => {
         if (abortedIds.has(id)) throw new Error('ABORTED');
 
@@ -234,13 +281,13 @@ async function transcribe(audio, id) {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 self.addEventListener('message', async (event) => {
-  const { type, model, audio, id } = event.data;
+  const { type, model, audio, id, language } = event.data;
   switch (type) {
     case 'load':
       await loadModel(model);
       break;
     case 'transcribe':
-      await transcribe(audio, id);
+      await transcribe(audio, id, language);
       break;
     case 'abort':
       abortedIds.add(id);
