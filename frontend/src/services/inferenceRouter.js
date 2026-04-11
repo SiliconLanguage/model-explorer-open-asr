@@ -16,6 +16,7 @@
 let workerInstance = null;
 let workerReadyResolve = null;
 let workerReadyReject = null;  // companion reject for the load promise
+let workerLoadedModelId = null; // mirrors worker's loadedModelId for fast cache hit
 const pendingCallbacks = new Map(); // id → { resolve, reject, onProgress }
 
 function getWorker() {
@@ -31,11 +32,14 @@ function getWorker() {
     const { type, id, stable, unstable, transcript, ttft_ms, itl_ms, rtfx, message } = event.data;
 
     // ── Load lifecycle messages ─────────────────────────────────────────────
-    if (type === 'ready' && workerReadyResolve) {
-      const res = workerReadyResolve;
-      workerReadyResolve = null;
-      workerReadyReject = null;
-      res();
+    if (type === 'ready') {
+      workerLoadedModelId = event.data.modelId ?? workerLoadedModelId;
+      if (workerReadyResolve) {
+        const res = workerReadyResolve;
+        workerReadyResolve = null;
+        workerReadyReject = null;
+        res();
+      }
       return;
     }
 
@@ -71,6 +75,8 @@ function getWorker() {
 }
 
 async function ensureModelLoaded(modelId) {
+  // Fast path: model already cached in worker — skip the message round-trip
+  if (workerLoadedModelId === modelId) return;
   const worker = getWorker();
   return new Promise((resolve, reject) => {
     workerReadyResolve = resolve;
@@ -91,10 +97,13 @@ async function routeWebGPU(modelId, audioBuffer, onProgress) {
 
 // ── Server-side / vLLM client ─────────────────────────────────────────────────
 
-async function routeServer(modelId, audioFile, onProgress) {
+async function routeServer(modelId, audioFile, onProgress, engine) {
   const form = new FormData();
   form.append('audio', audioFile);
   form.append('model', modelId);
+  if (engine) {
+    form.append('engine', engine);
+  }
 
   // Use streaming endpoint for token-by-token delivery
   const response = await fetch('/api/transcribe/stream', {
@@ -167,14 +176,14 @@ async function routeServer(modelId, audioFile, onProgress) {
  * @param {function} [onProgress] Called with partial results during streaming
  * @returns {Promise<{transcript:string, ttft_ms:number, itl_ms:number, rtfx:number, mode:string}>}
  */
-export async function route(modelId, audio, onProgress) {
-  if (modelId.includes('WebGPU')) {
+export async function route(modelId, audio, onProgress, engine = undefined, mode = 'server') {
+  if (mode === 'webgpu') {
     // Ensure we have a Float32Array of 16 kHz samples
     const audioBuffer = audio instanceof Float32Array ? audio : await fileToFloat32(audio);
     return routeWebGPU(modelId, audioBuffer, onProgress);
   }
   // Server-side: pass the raw File for multipart upload
-  return routeServer(modelId, audio, onProgress);
+  return routeServer(modelId, audio, onProgress, engine);
 }
 
 // ── Helper: decode File → Float32Array at 16 kHz ──────────────────────────────

@@ -267,6 +267,30 @@ body {
   flex-wrap: wrap;
 }
 
+/* ── Sample clips ──────────────────────────────────────────────────────────── */
+
+.sample-clips {
+  margin-top: 0.75rem;
+}
+
+.sample-clips-hint {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  margin: 0 0 0.5rem;
+}
+
+.sample-clips-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.btn-sample-active {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary);
+}
+
 .file-name {
   font-size: 0.8rem;
   color: var(--color-text-muted);

@@ -22,7 +22,7 @@
  *   { type: 'error',      id, message: string }
  */
 
-import { pipeline, env } from '@xenova/transformers';
+import { pipeline, env } from '@huggingface/transformers';
 
 // ── Cache configuration ───────────────────────────────────────────────────────
 // Point transformers.js at the Cache Storage API so ONNX weights survive
@@ -33,7 +33,7 @@ env.useBrowserCache = typeof caches !== 'undefined';
 env.allowLocalModels = false;
 
 // ── State ─────────────────────────────────────────────────────────────────────
-/** @type {import('@xenova/transformers').Pipeline | null} */
+/** @type {import('@huggingface/transformers').Pipeline | null} */
 let asr = null;
 let loadedModelId = null;
 const abortedIds = new Set();
@@ -97,7 +97,7 @@ class LocalAgreement2 {
 // ── Model loading ─────────────────────────────────────────────────────────────
 async function loadModel(modelId) {
   if (asr && loadedModelId === modelId) {
-    self.postMessage({ type: 'ready' });
+    self.postMessage({ type: 'ready', modelId });
     return;
   }
   try {
@@ -118,7 +118,7 @@ async function loadModel(modelId) {
       });
     }
     loadedModelId = modelId;
-    self.postMessage({ type: 'ready' });
+    self.postMessage({ type: 'ready', modelId });
   } catch (err) {
     // Reset state so a subsequent load attempt can retry cleanly.
     asr = null;
@@ -142,6 +142,7 @@ async function transcribe(audio, id) {
   try {
     // transformers.js callback_function fires after each generated token
     const result = await asr(audio, {
+      task: 'transcribe',
       return_timestamps: true,
       chunk_length_s: 30,
       stride_length_s: 5,
@@ -152,39 +153,47 @@ async function transcribe(audio, id) {
         if (firstTokenTime === null) firstTokenTime = now;
         tokenTimestamps.push(now);
 
-        // Token-ID consensus: run LocalAgreement on encoded sub-word IDs first,
-        // then decode stable/unstable segments for UI rendering.
-        const beamText = beams[0]?.text ?? '';
-        /** @type {number[]} */
-        let tokenIds = [];
+        // Wrap in try/catch — the WhisperTextStreamer in transformers.js can
+        // throw "token_ids must be a non-empty array of integers" when
+        // timestamp tokens are emitted.  Swallowing the error here lets the
+        // pipeline complete; the final bulk result is still accurate.
+        try {
+          const beamText = beams[0]?.text ?? '';
+          /** @type {number[]} */
+          let tokenIds = [];
 
-        if (asr.tokenizer?.encode) {
-          const encoded = asr.tokenizer.encode(beamText);
-          if (Array.isArray(encoded)) {
-            tokenIds = encoded.filter((v) => Number.isFinite(v));
-          } else if (Array.isArray(encoded?.ids)) {
-            tokenIds = encoded.ids.filter((v) => Number.isFinite(v));
-          } else if (Array.isArray(encoded?.input_ids)) {
-            tokenIds = encoded.input_ids.filter((v) => Number.isFinite(v));
-          } else if (Array.isArray(encoded?.[0])) {
-            tokenIds = encoded[0].filter((v) => Number.isFinite(v));
+          if (asr.tokenizer?.encode) {
+            const encoded = asr.tokenizer.encode(beamText);
+            if (Array.isArray(encoded)) {
+              tokenIds = encoded.filter((v) => Number.isFinite(v));
+            } else if (Array.isArray(encoded?.ids)) {
+              tokenIds = encoded.ids.filter((v) => Number.isFinite(v));
+            } else if (Array.isArray(encoded?.input_ids)) {
+              tokenIds = encoded.input_ids.filter((v) => Number.isFinite(v));
+            } else if (Array.isArray(encoded?.[0])) {
+              tokenIds = encoded[0].filter((v) => Number.isFinite(v));
+            }
           }
+
+          // Fallback to beam token IDs when encode() is unavailable or returns empty.
+          if (tokenIds.length === 0) {
+            tokenIds = (beams[0]?.output_token_ids ?? []).filter((v) => Number.isFinite(v));
+          }
+
+          if (tokenIds.length === 0) return; // nothing to consensus on yet
+
+          const { stableTokenIds, unstableTokenIds } = la2.update(tokenIds);
+          const stable = asr.tokenizer?.decode
+            ? asr.tokenizer.decode(stableTokenIds, { skip_special_tokens: true })
+            : '';
+          const unstable = asr.tokenizer?.decode
+            ? asr.tokenizer.decode(unstableTokenIds, { skip_special_tokens: true })
+            : '';
+
+          self.postMessage({ type: 'progress', id, stable, unstable });
+        } catch (cbErr) {
+          // Silently skip this streaming tick; the final result is unaffected.
         }
-
-        // Fallback to beam token IDs when encode() is unavailable or returns empty.
-        if (tokenIds.length === 0) {
-          tokenIds = (beams[0]?.output_token_ids ?? []).filter((v) => Number.isFinite(v));
-        }
-
-        const { stableTokenIds, unstableTokenIds } = la2.update(tokenIds);
-        const stable = asr.tokenizer?.decode
-          ? asr.tokenizer.decode(stableTokenIds, { skip_special_tokens: true })
-          : '';
-        const unstable = asr.tokenizer?.decode
-          ? asr.tokenizer.decode(unstableTokenIds, { skip_special_tokens: true })
-          : '';
-
-        self.postMessage({ type: 'progress', id, stable, unstable });
       },
     });
 

@@ -1,5 +1,7 @@
-# ── Base image: CUDA 12.1 + cuDNN 8 for PyTorch & vLLM ──────────────────────
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# ── Base image: CUDA 12.8 + cuDNN (devel) for PyTorch, vLLM, and FlashInfer ──
+# The devel variant provides nvcc for FlashInfer JIT compilation of attention
+# kernels.  CUDA 12.8 is the minimum with native Blackwell (SM 12.0) support.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 LABEL maintainer="Open-ASR Model Explorer"
 LABEL description="FastAPI backend for hybrid ASR inference testbed (vLLM server-side routing)"
@@ -33,6 +35,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN /opt/venv/bin/pip install --no-cache-dir --upgrade "pip<26" \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ── Patch vLLM attention backend priorities for Blackwell (SM 12.0) ──────────
+# FlashAttention 2 segfaults during encoder cache profiling on SM 12.0 because
+# the bundled CUDA 12.1 toolkit predates the Blackwell architecture.  Swap the
+# priority so FlashInfer (main attn) and TORCH_SDPA (vit/encoder attn) are
+# tried first; FLASH_ATTN becomes a last resort.
+COPY patch_vllm_blackwell.py /tmp/patch_vllm_blackwell.py
+RUN python /tmp/patch_vllm_blackwell.py \
+    && find /opt/venv -path '*/vllm/platforms/__pycache__' -exec rm -rf {} + 2>/dev/null \
+    && rm /tmp/patch_vllm_blackwell.py \
+    || true
 
 # ── Copy application source ───────────────────────────────────────────────────
 COPY app.py .

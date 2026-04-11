@@ -10,16 +10,18 @@
  *   - Metrics dashboard
  */
 
-import { useState, useCallback, useRef } from 'react';
-import ModelSelector from './components/ModelSelector';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import ModelSelector, { getModelByValue } from './components/ModelSelector';
 import AudioRecorder from './components/AudioRecorder';
+import SampleClips from './components/SampleClips';
 import MetricsDashboard from './components/MetricsDashboard';
 import TranscriptDisplay from './components/TranscriptDisplay';
 import { route } from './services/inferenceRouter';
 
 export default function App() {
-  const [model, setModel] = useState('Cohere-transcribe-03-2026');
+  const [modelValue, setModelValue] = useState('cohere-hf-gpu');
   const [audioFile, setAudioFile] = useState(null);
+  const [audioUrl, setAudioUrl] = useState(null);
   const [status, setStatus] = useState('idle'); // idle | loading | streaming | done | error
   const [errorMsg, setErrorMsg] = useState(null);
 
@@ -32,8 +34,17 @@ export default function App() {
   const [transcribeMode, setTranscribeMode] = useState(null);
 
   const abortRef = useRef(false);
+  const selectedModel = getModelByValue(modelValue);
 
   const isRunning = status === 'loading' || status === 'streaming';
+
+  // ── Audio URL lifecycle ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!audioFile) { setAudioUrl(null); return; }
+    const url = URL.createObjectURL(audioFile);
+    setAudioUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [audioFile]);
 
   // ── Progress callback from inferenceRouter ─────────────────────────────────
   const handleProgress = useCallback((data) => {
@@ -70,7 +81,7 @@ export default function App() {
     setTranscribeMode(null);
 
     try {
-      const result = await route(model, audioFile, handleProgress);
+      const result = await route(selectedModel.id, audioFile, handleProgress, selectedModel.engine, selectedModel.mode);
 
       if (abortRef.current) return;
 
@@ -121,12 +132,13 @@ export default function App() {
       <main className="app-main">
         <div className="card">
           {/* ── Model selection ────────────────────────────────────────── */}
-          <ModelSelector value={model} onChange={setModel} disabled={isRunning} />
+          <ModelSelector value={modelValue} onChange={setModelValue} disabled={isRunning} />
 
           {/* ── Audio input ────────────────────────────────────────────── */}
           <section className="section">
             <h2 className="section-title">Audio Input</h2>
-            <AudioRecorder onAudioReady={setAudioFile} disabled={isRunning} />
+            <AudioRecorder onAudioReady={setAudioFile} disabled={isRunning} externalAudioUrl={audioUrl} />
+            <SampleClips onSampleSelect={setAudioFile} disabled={isRunning} />
           </section>
 
           {/* ── Action buttons ─────────────────────────────────────────── */}
@@ -177,7 +189,7 @@ export default function App() {
               stable={stableText}
               unstable={unstableText}
               loading={status === 'loading'}
-              mode={model.includes('WebGPU') ? 'webgpu' : 'server'}
+              mode={selectedModel.mode === 'webgpu' ? 'webgpu' : 'server'}
             />
           </div>
         )}

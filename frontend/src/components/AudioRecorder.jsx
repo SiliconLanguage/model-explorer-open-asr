@@ -11,7 +11,7 @@ import { useRef, useState } from 'react';
 
 const SUPPORTED_TYPES = ['audio/wav', 'audio/mpeg', 'audio/ogg', 'audio/flac', 'audio/webm'];
 
-export default function AudioRecorder({ onAudioReady, disabled }) {
+export default function AudioRecorder({ onAudioReady, disabled, externalAudioUrl }) {
   const [recording, setRecording] = useState(false);
   const [audioUrl, setAudioUrl] = useState(null);
   const [fileName, setFileName] = useState(null);
@@ -100,13 +100,13 @@ export default function AudioRecorder({ onAudioReady, disabled }) {
         </p>
       )}
 
-      {/* Playback – only render audio element if URL is a safe blob: URL */}
-      {audioUrl && audioUrl.startsWith('blob:') && (
+      {/* Playback — show player for internal blob URLs or external (sample) URLs */}
+      {(externalAudioUrl || (audioUrl && audioUrl.startsWith('blob:'))) && (
         <audio
           className="audio-player"
           controls
-          src={audioUrl}
-          key={audioUrl}
+          src={externalAudioUrl || audioUrl}
+          key={externalAudioUrl || audioUrl}
         />
       )}
     </div>
