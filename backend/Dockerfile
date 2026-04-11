@@ -7,8 +7,10 @@ LABEL description="FastAPI backend for hybrid ASR inference testbed (vLLM server
 # ── System dependencies ───────────────────────────────────────────────────────
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
         python3.11 \
         python3.11-dev \
+    python3.11-venv \
         python3-pip \
         libsndfile1 \
         ffmpeg \
@@ -19,14 +21,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
     && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
+# Create an isolated Python 3.11 environment and use its pip for installs.
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 # ── Working directory ─────────────────────────────────────────────────────────
 WORKDIR /app
 
 # ── Install Python dependencies ───────────────────────────────────────────────
 # Copy requirements first to leverage Docker layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN /opt/venv/bin/pip install --no-cache-dir --upgrade "pip<26" \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ── Copy application source ───────────────────────────────────────────────────
 COPY app.py .

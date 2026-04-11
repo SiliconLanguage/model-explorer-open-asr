@@ -27,7 +27,7 @@ export default function TranscriptDisplay({ stable, unstable, loading, mode }) {
         )}
       </div>
 
-      <div className="transcript-body" aria-live="polite" aria-label="Transcription output">
+      <div className="transcript-body transcript-output" aria-live="polite" aria-label="Transcription output">
         {loading && !stable && !unstable && (
           <span className="transcript-loading">
             <span className="spinner" aria-hidden="true" />

@@ -9,8 +9,12 @@ Strategy-based routing:
 from __future__ import annotations
 
 import io
+import asyncio
 import time
+import os
 import logging
+import tempfile
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -34,7 +38,7 @@ logger = logging.getLogger(__name__)
 # Supported server-side models
 # ---------------------------------------------------------------------------
 SUPPORTED_MODELS: dict[str, str] = {
-    "Cohere-transcribe-03-2026": "CohereForAI/c4ai-command-r-plus",
+    "Cohere-transcribe-03-2026": "CohereLabs/cohere-transcribe-03-2026",
     "Qwen3-ASR-1.7B": "Qwen/Qwen3-ASR-1.7B",
     "ibm-granite/granite-4.0-1b-speech": "ibm-granite/granite-4.0-1b-speech",
 }
@@ -48,12 +52,53 @@ MAX_AUDIO_SAMPLES = TARGET_SR * 30
 # vLLM engine – loaded lazily on first request to keep startup fast in dev
 # ---------------------------------------------------------------------------
 _vllm_engines: dict[str, object] = {}
+_vllm_failed_models: set[str] = set()
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.3f", name, raw, default)
+        return default
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+
+
+ALLOW_MOCK_FALLBACK = _read_bool_env("ALLOW_MOCK_FALLBACK", False)
+ENGINE_INIT_TIMEOUT_S = _read_float_env("OPENASR_ENGINE_INIT_TIMEOUT_S", 120.0)
+GPU_MEMORY_UTILIZATION = _read_float_env("GPU_MEMORY_UTILIZATION", 0.65)
+VLLM_MAX_MODEL_LEN = _read_int_env("OPENASR_VLLM_MAX_MODEL_LEN", 8192)
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+VLLM_ENFORCE_EAGER = _read_bool_env("OPENASR_VLLM_ENFORCE_EAGER", True)
 
 
 def _get_engine(model_key: str):
     """Return (or lazily create) the vLLM AsyncLLMEngine for *model_key*."""
     if model_key in _vllm_engines:
         return _vllm_engines[model_key]
+
+    if model_key in _vllm_failed_models:
+        return None
 
     try:
         from vllm import AsyncEngineArgs, AsyncLLMEngine  # type: ignore
@@ -67,37 +112,108 @@ def _get_engine(model_key: str):
             #    decode steps of other in-flight requests.
             enable_chunked_prefill=True,
             max_num_batched_tokens=2048,
-            # ── Reserve ample KV-cache space while keeping GPU busy.
-            gpu_memory_utilization=0.88,
-            # ── Async streaming for token-by-token delivery.
-            disable_log_requests=False,
+            # ── Keep a safer default to avoid OOM on mid-range GPUs.
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            max_model_len=VLLM_MAX_MODEL_LEN,
+            enforce_eager=VLLM_ENFORCE_EAGER,
+            # ── Required for models with custom modeling code (e.g. Cohere ASR).
+            trust_remote_code=True,
+            # ── Limit audio encoder profiling to 1 item to avoid segfault
+            #    during warmup on constrained environments (e.g. WSL).
+            limit_mm_per_prompt={"audio": 1},
         )
         engine = AsyncLLMEngine.from_engine_args(engine_args)
         _vllm_engines[model_key] = engine
         logger.info("Engine ready for %s", model_key)
         return engine
     except ImportError:
+        _vllm_failed_models.add(model_key)
         logger.warning(
-            "vLLM not available – returning mock engine for development."
+            "vLLM not available."
         )
         return None
+    except Exception as exc:
+        _vllm_failed_models.add(model_key)
+        logger.warning(
+            "vLLM engine init failed (%s).",
+            exc,
+        )
+        return None
+
+
+async def _get_engine_async(model_key: str, timeout_s: float = ENGINE_INIT_TIMEOUT_S):
+    """Bound engine initialization latency so requests can fail fast and visibly."""
+    if model_key in _vllm_engines:
+        return _vllm_engines[model_key]
+    if model_key in _vllm_failed_models:
+        return None
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_get_engine, model_key), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "vLLM engine init timed out for %s after %.1fs. It may finish in the background.",
+            model_key,
+            timeout_s,
+        )
+        return _vllm_engines.get(model_key)
+
+
+def _model_requires_hf_token(model_key: str) -> bool:
+    model_id = SUPPORTED_MODELS[model_key].lower()
+    return (
+        model_id.startswith("cohereforai/")
+        or model_id.startswith("coherelabs/")
+        or model_id.startswith("ibm-granite/")
+    )
+
+
+def _ensure_model_auth(model_key: str) -> None:
+    if _model_requires_hf_token(model_key) and not HF_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                f"Model '{model_key}' requires Hugging Face authentication. "
+                "Set HF_TOKEN in backend environment."
+            ),
+        )
+
+
+def _runtime_mode() -> str:
+    if _vllm_engines:
+        return "real"
+    if ALLOW_MOCK_FALLBACK:
+        return "mock"
+    return "degraded"
 
 
 # ---------------------------------------------------------------------------
 # Audio pre-processing helpers
 # ---------------------------------------------------------------------------
 
-def _load_audio_bytes(data: bytes) -> np.ndarray:
+def _load_audio_bytes(data: bytes, filename: str | None = None) -> np.ndarray:
     """Decode audio bytes → mono float32 NumPy array at TARGET_SR."""
-    with io.BytesIO(data) as buf:
-        waveform, sr = sf.read(buf, dtype="float32", always_2d=False)
-    # Resample if necessary
-    if sr != TARGET_SR:
-        waveform = librosa.resample(waveform, orig_sr=sr, target_sr=TARGET_SR)
-    # Convert stereo → mono
-    if waveform.ndim == 2:
-        waveform = waveform.mean(axis=1)
-    return waveform
+    try:
+        with io.BytesIO(data) as buf:
+            waveform, sr = sf.read(buf, dtype="float32", always_2d=False)
+        # Resample if necessary
+        if sr != TARGET_SR:
+            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=TARGET_SR)
+        # Convert stereo → mono
+        if waveform.ndim == 2:
+            waveform = waveform.mean(axis=1)
+        return waveform
+    except Exception:
+        # Fallback path for formats often emitted by MediaRecorder
+        # (e.g. webm/opus) that may fail with direct soundfile decode.
+        suffix = Path(filename).suffix if filename else ".webm"
+        if not suffix:
+            suffix = ".webm"
+        with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            waveform, _ = librosa.load(tmp.name, sr=TARGET_SR, mono=True)
+        return waveform.astype(np.float32, copy=False)
 
 
 def _pad_or_truncate(waveform: np.ndarray) -> np.ndarray:
@@ -131,9 +247,18 @@ class TranscribeResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Open-ASR Model Explorer backend starting up.")
+    logger.info(
+        "Runtime config: gpu_memory_utilization=%.2f, max_model_len=%d, init_timeout=%.1fs, allow_mock_fallback=%s, enforce_eager=%s",
+        GPU_MEMORY_UTILIZATION,
+        VLLM_MAX_MODEL_LEN,
+        ENGINE_INIT_TIMEOUT_S,
+        ALLOW_MOCK_FALLBACK,
+        VLLM_ENFORCE_EAGER,
+    )
     yield
     logger.info("Open-ASR Model Explorer backend shutting down.")
     _vllm_engines.clear()
+    _vllm_failed_models.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +290,19 @@ app.add_middleware(
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "loaded_models": list(_vllm_engines.keys())}
+    mode = _runtime_mode()
+    status = "ok" if mode == "real" else "degraded"
+    return {
+        "status": status,
+        "mode": mode,
+        "loaded_models": list(_vllm_engines.keys()),
+        "failed_models": sorted(_vllm_failed_models),
+        "allow_mock_fallback": ALLOW_MOCK_FALLBACK,
+        "engine_init_timeout_s": ENGINE_INIT_TIMEOUT_S,
+        "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+        "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+        "vllm_enforce_eager": VLLM_ENFORCE_EAGER,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +342,12 @@ async def transcribe(
             status_code=404,
             detail=f"Unknown model '{model}'. Available: {list(SUPPORTED_MODELS.keys())}",
         )
+    _ensure_model_auth(model)
 
     # ── 1. Decode & normalise audio ──────────────────────────────────────────
     raw_bytes = await audio.read()
     try:
-        waveform = _load_audio_bytes(raw_bytes)
+        waveform = _load_audio_bytes(raw_bytes, audio.filename)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Cannot decode audio: {exc}") from exc
 
@@ -217,12 +355,20 @@ async def transcribe(
     waveform_padded = _pad_or_truncate(waveform)
 
     # ── 2. Attempt vLLM inference ────────────────────────────────────────────
-    engine = _get_engine(model)
+    engine = await _get_engine_async(model)
     request_start = time.perf_counter()
 
     if engine is not None:
         transcript, ttft_ms, itl_ms = await _run_vllm(engine, waveform_padded, model)
     else:
+        if not ALLOW_MOCK_FALLBACK:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Real inference unavailable for '{model}'. "
+                    "vLLM engine failed or timed out during initialization."
+                ),
+            )
         # Development fallback when vLLM / GPU is unavailable
         transcript, ttft_ms, itl_ms = await _mock_transcribe(waveform_padded, model)
 
@@ -333,16 +479,26 @@ async def transcribe_stream(
         raise HTTPException(status_code=400, detail="WebGPU models run client-side.")
     if model not in SUPPORTED_MODELS:
         raise HTTPException(status_code=404, detail=f"Unknown model '{model}'.")
+    _ensure_model_auth(model)
 
     raw_bytes = await audio.read()
     try:
-        waveform = _load_audio_bytes(raw_bytes)
+        waveform = _load_audio_bytes(raw_bytes, audio.filename)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Cannot decode audio: {exc}") from exc
 
     audio_duration_s = len(waveform) / TARGET_SR
     waveform_padded = _pad_or_truncate(waveform)
-    engine = _get_engine(model)
+    engine = await _get_engine_async(model)
+
+    if engine is None and not ALLOW_MOCK_FALLBACK:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Real inference unavailable for '{model}'. "
+                "vLLM engine failed or timed out during initialization."
+            ),
+        )
 
     async def event_generator() -> AsyncGenerator[str, None]:
         import json

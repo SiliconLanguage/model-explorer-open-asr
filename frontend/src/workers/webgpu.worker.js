@@ -41,9 +41,9 @@ const abortedIds = new Set();
 // ── LocalAgreement-2 helpers ──────────────────────────────────────────────────
 /**
  * Returns the longest common prefix (token-level) shared by *a* and *b*.
- * @param {string[]} a
- * @param {string[]} b
- * @returns {string[]}
+ * @param {number[]} a
+ * @param {number[]} b
+ * @returns {number[]}
  */
 function longestCommonPrefix(a, b) {
   const len = Math.min(a.length, b.length);
@@ -61,14 +61,14 @@ function longestCommonPrefix(a, b) {
  */
 class LocalAgreement2 {
   constructor() {
-    this.prev = /** @type {string[]} */ ([]);
-    this.stableTokens = /** @type {string[]} */ ([]);
+    this.prev = /** @type {number[]} */ ([]);
+    this.stableTokenIds = /** @type {number[]} */ ([]);
   }
 
   /**
-   * Feed in the latest hypothesis tokens.
-   * @param {string[]} current  Current hypothesis split into tokens
-   * @returns {{ stable: string, unstable: string }}
+   * Feed in the latest hypothesis token IDs.
+   * @param {number[]} current  Current hypothesis token IDs
+   * @returns {{ stableTokenIds: number[], unstableTokenIds: number[] }}
    */
   update(current) {
     const agreed = longestCommonPrefix(this.prev, current);
@@ -78,19 +78,19 @@ class LocalAgreement2 {
     // shorter hypothesis (e.g. at the start of a new audio chunk), which would
     // otherwise show confirmed text that is no longer in the active hypothesis.
     const newStableLen = Math.min(
-      Math.max(agreed.length, this.stableTokens.length),
+      Math.max(agreed.length, this.stableTokenIds.length),
       current.length,
     );
-    this.stableTokens = current.slice(0, newStableLen);
+    this.stableTokenIds = current.slice(0, newStableLen);
     this.prev = current;
-    const stable = this.stableTokens.join('');
-    const unstable = current.slice(this.stableTokens.length).join('');
-    return { stable, unstable };
+    const stableTokenIds = this.stableTokenIds;
+    const unstableTokenIds = current.slice(this.stableTokenIds.length);
+    return { stableTokenIds, unstableTokenIds };
   }
 
   reset() {
     this.prev = [];
-    this.stableTokens = [];
+    this.stableTokenIds = [];
   }
 }
 
@@ -152,16 +152,37 @@ async function transcribe(audio, id) {
         if (firstTokenTime === null) firstTokenTime = now;
         tokenTimestamps.push(now);
 
-        // Extract hypothesis text from the first beam
-        const hypothesis = beams[0]?.output_token_ids ?? [];
-        const decoded = asr.tokenizer
-          ? asr.tokenizer.decode(hypothesis, { skip_special_tokens: true })
-          : (beams[0]?.text ?? '');
+        // Token-ID consensus: run LocalAgreement on encoded sub-word IDs first,
+        // then decode stable/unstable segments for UI rendering.
+        const beamText = beams[0]?.text ?? '';
+        /** @type {number[]} */
+        let tokenIds = [];
 
-        // Split on whitespace boundaries, preserving leading space within each word
-        // to allow correct reconstruction. Use non-capturing split to avoid empty strings.
-        const tokens = decoded.match(/\S+\s*/g) ?? [];
-        const { stable, unstable } = la2.update(tokens);
+        if (asr.tokenizer?.encode) {
+          const encoded = asr.tokenizer.encode(beamText);
+          if (Array.isArray(encoded)) {
+            tokenIds = encoded.filter((v) => Number.isFinite(v));
+          } else if (Array.isArray(encoded?.ids)) {
+            tokenIds = encoded.ids.filter((v) => Number.isFinite(v));
+          } else if (Array.isArray(encoded?.input_ids)) {
+            tokenIds = encoded.input_ids.filter((v) => Number.isFinite(v));
+          } else if (Array.isArray(encoded?.[0])) {
+            tokenIds = encoded[0].filter((v) => Number.isFinite(v));
+          }
+        }
+
+        // Fallback to beam token IDs when encode() is unavailable or returns empty.
+        if (tokenIds.length === 0) {
+          tokenIds = (beams[0]?.output_token_ids ?? []).filter((v) => Number.isFinite(v));
+        }
+
+        const { stableTokenIds, unstableTokenIds } = la2.update(tokenIds);
+        const stable = asr.tokenizer?.decode
+          ? asr.tokenizer.decode(stableTokenIds, { skip_special_tokens: true })
+          : '';
+        const unstable = asr.tokenizer?.decode
+          ? asr.tokenizer.decode(unstableTokenIds, { skip_special_tokens: true })
+          : '';
 
         self.postMessage({ type: 'progress', id, stable, unstable });
       },

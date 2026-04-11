@@ -18,6 +18,47 @@ pinned: false
 
 A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qwen3-ASR, IBM Granite) featuring vLLM server-side routing and transformers.js WebGPU client-side inference.
 
+## Quick Start
+
+### 1) Environment Setup
+
+Create a local environment file from the template:
+
+```bash
+cp .env.example .env
+```
+
+Set required values in `.env`:
+
+- `HF_TOKEN` — required for gated server-side models (for example Cohere and Granite)
+- `GPU_MEMORY_UTILIZATION=0.65` (start conservative; tune upward once stable)
+- `OPENASR_ENGINE_INIT_TIMEOUT_S=120` (first cold boot may include compilation)
+- `OPENASR_VLLM_MAX_MODEL_LEN=8192`
+- `OPENASR_VLLM_ENFORCE_EAGER=true` (recommended on WSL to avoid compile-path crashes)
+- `ALLOW_MOCK_FALLBACK=false` (recommended to avoid masking real backend failures)
+- `PORT=8000`
+
+### 2) Start the Full Stack
+
+```bash
+docker compose up --build
+```
+
+Frontend is served on `http://localhost:3000` and backend API on `http://localhost:8000`.
+
+### 3) Agent Protocol
+
+When infrastructure or documentation changes, follow this protocol:
+
+- `/sync-infrastructure` — sync deployment documentation from `docker-compose.yml` and `nginx.conf` into the AgentWiki topology docs.
+- `/document-logic` — analyze implementation logic and update conceptual docs (for example LocalAgreement-2 behavior and router integration).
+
+### Verification Checklist
+
+- [ ] **WebGPU**: WebGPU models run client-side and stream stable/unstable transcript updates in the UI.
+- [ ] **Streaming**: Server-side SSE path streams token updates continuously without proxy buffering delays.
+- [ ] **vLLM**: Backend starts with expected scheduler/runtime settings and serves `/health` successfully.
+
 ---
 
 ## Architecture
@@ -83,7 +124,7 @@ A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qw
 ### Backend vLLM Configuration
 - **Chunked Prefill** – `enable_chunked_prefill=True` prevents long audio prefills from starving decode steps
 - **Pre-batching normalisation** – all audio padded/truncated to 30 s before entering the scheduler
-- **Resource constraints** – `max_num_batched_tokens=2048`, `gpu_memory_utilization=0.88`
+- **Resource constraints** – `max_num_batched_tokens=2048`, env-driven `gpu_memory_utilization`, env-driven `max_model_len`
 
 ---
 
@@ -221,7 +262,8 @@ Response:
 Same as above but returns **Server-Sent Events** with token-by-token streaming.
 
 ### `GET /health`
-Returns `{ "status": "ok", "loaded_models": [...] }`.
+Returns readiness details such as `status`, `mode`, `loaded_models`, and `failed_models`.
+`status=ok` means at least one real vLLM model is ready; `status=degraded` means no real model is currently serving.
 
 ### `GET /models`
 Returns the list of available server-side model keys.

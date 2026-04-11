@@ -23,10 +23,12 @@ services:
     environment:
       - HF_HOME=/hf_cache
       - TRANSFORMERS_CACHE=/hf_cache
-      # Uncomment and set HF_TOKEN if you access gated models on HuggingFace
-      # (e.g. Cohere-transcribe-03-2026 or IBM Granite may require acceptance
-      # of model terms before download).
-      # - HF_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.65}
+      - OPENASR_ENGINE_INIT_TIMEOUT_S=${OPENASR_ENGINE_INIT_TIMEOUT_S:-120}
+      - OPENASR_VLLM_MAX_MODEL_LEN=${OPENASR_VLLM_MAX_MODEL_LEN:-8192}
+      - OPENASR_VLLM_ENFORCE_EAGER=${OPENASR_VLLM_ENFORCE_EAGER:-true}
+      - ALLOW_MOCK_FALLBACK=${ALLOW_MOCK_FALLBACK:-false}
     # GPU access – requires the NVIDIA Container Toolkit.
     # Remove the `deploy` block entirely if running CPU-only.
     deploy:
