@@ -29,6 +29,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import gradio as gr
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -597,13 +598,65 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Root – HF Spaces iframe landing / health-check probe
+# Gradio UI – mounted at / for HF Spaces iframe
 # ---------------------------------------------------------------------------
 
-@app.get("/")
-async def root():
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/docs")
+def _gradio_transcribe(audio_path: str, model_name: str, language: str):
+    """Synchronous wrapper called by Gradio – posts to the local FastAPI endpoint."""
+    import httpx
+
+    if not audio_path:
+        return "Please upload or record an audio file."
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    port = int(os.environ.get("PORT", "7860"))
+    resp = httpx.post(
+        f"http://127.0.0.1:{port}/transcribe",
+        files={"audio": ("audio.wav", audio_bytes, "audio/wav")},
+        data={"model": model_name, "language": language},
+        timeout=120.0,
+    )
+    if resp.status_code != 200:
+        return f"Error {resp.status_code}: {resp.text}"
+    result = resp.json()
+    metrics = (
+        f"\n\n---\nTTFT: {result.get('ttft_ms', 'N/A')} ms  |  "
+        f"ITL: {result.get('itl_ms', 'N/A')} ms  |  "
+        f"RTFx: {result.get('rtfx', 'N/A')}"
+    )
+    return result.get("transcript", "") + metrics
+
+
+_SERVER_MODELS = [k for k in SUPPORTED_MODELS.keys() if "/" not in k or k.startswith("ibm-") or k.startswith("openai/")]
+
+demo = gr.Interface(
+    fn=_gradio_transcribe,
+    inputs=[
+        gr.Audio(type="filepath", label="Upload or record audio"),
+        gr.Dropdown(
+            choices=list(SUPPORTED_MODELS.keys()),
+            value="openai/whisper-base",
+            label="Model",
+        ),
+        gr.Dropdown(
+            choices=["english", "chinese", "spanish", "french", "german",
+                     "japanese", "korean", "hindi", "arabic", "portuguese"],
+            value="english",
+            label="Language",
+        ),
+    ],
+    outputs=gr.Textbox(label="Transcript", lines=8),
+    title="Open-ASR Model Explorer",
+    description=(
+        "Hybrid inference testbed for open-source ASR models. "
+        "Upload audio or record from your microphone, pick a model, and transcribe."
+    ),
+    allow_flagging="never",
+)
+
+app = gr.mount_gradio_app(app, demo, path="/")
 
 
 # ---------------------------------------------------------------------------
