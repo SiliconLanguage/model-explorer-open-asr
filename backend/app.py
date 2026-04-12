@@ -601,7 +601,7 @@ app.add_middleware(
 # Gradio UI – mounted at / for HF Spaces iframe
 # ---------------------------------------------------------------------------
 
-def _gradio_transcribe(audio_path: str, model_name: str, language: str):
+def _gradio_transcribe(audio_path: str, model_name: str, engine: str, language: str):
     """Synchronous wrapper called by Gradio – posts to the local FastAPI endpoint."""
     import httpx
 
@@ -615,7 +615,7 @@ def _gradio_transcribe(audio_path: str, model_name: str, language: str):
     resp = httpx.post(
         f"http://127.0.0.1:{port}/transcribe",
         files={"audio": ("audio.wav", audio_bytes, "audio/wav")},
-        data={"model": model_name, "language": language},
+        data={"model": model_name, "engine": engine, "language": language},
         timeout=120.0,
     )
     if resp.status_code != 200:
@@ -643,6 +643,11 @@ demo = gr.Interface(
             label="Model",
         ),
         gr.Dropdown(
+            choices=["hf-gpu", "hf-cpu", "vllm"],
+            value="hf-gpu",
+            label="Engine",
+        ),
+        gr.Dropdown(
             choices=["english", "chinese", "spanish", "french", "german",
                      "japanese", "korean", "hindi", "arabic", "portuguese"],
             value="english",
@@ -653,17 +658,22 @@ demo = gr.Interface(
     title="Open-ASR Model Explorer",
     description=(
         "Hybrid inference testbed for open-source ASR models. "
-        "Upload audio or record from your microphone, pick a model, and transcribe."
+        "Upload audio or record from your microphone, pick a model and engine, then transcribe.\n\n"
+        "**Engine options:** `hf-gpu` (HuggingFace Transformers on GPU), "
+        "`hf-cpu` (CPU-only fallback), `vllm` (vLLM optimised serving).\n\n"
+        "**Note:** WebGPU client-side models (Xenova/whisper-*, onnx-community/cohere-*) "
+        "run in-browser via transformers.js and are available in the "
+        "[full React UI](https://github.com/SiliconLanguage/model-explorer-open-asr) only."
     ),
     examples=[
-        [str(_SAMPLES_DIR / "english.wav"), "openai/whisper-base", "english"],
-        [str(_SAMPLES_DIR / "chinese.wav"), "openai/whisper-base", "chinese"],
-        [str(_SAMPLES_DIR / "french.wav"), "openai/whisper-base", "french"],
-        [str(_SAMPLES_DIR / "spanish.wav"), "openai/whisper-base", "spanish"],
-        [str(_SAMPLES_DIR / "japanese.wav"), "openai/whisper-base", "japanese"],
-        [str(_SAMPLES_DIR / "hindi.wav"), "openai/whisper-base", "hindi"],
+        [str(_SAMPLES_DIR / "english.wav"), "openai/whisper-base", "hf-gpu", "english"],
+        [str(_SAMPLES_DIR / "chinese.wav"), "openai/whisper-base", "hf-gpu", "chinese"],
+        [str(_SAMPLES_DIR / "french.wav"), "openai/whisper-base", "hf-gpu", "french"],
+        [str(_SAMPLES_DIR / "spanish.wav"), "openai/whisper-base", "hf-gpu", "spanish"],
+        [str(_SAMPLES_DIR / "japanese.wav"), "openai/whisper-base", "hf-gpu", "japanese"],
+        [str(_SAMPLES_DIR / "hindi.wav"), "openai/whisper-base", "hf-gpu", "hindi"],
     ],
-    allow_flagging="never",
+    flagging_mode="never",
 )
 
 
