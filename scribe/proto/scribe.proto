@@ -1,0 +1,67 @@
+syntax = "proto3";
+package scribe;
+option go_package = "github.com/SiliconLanguage/model-explorer-open-asr/scribe/gateway/pb";
+
+// ScribeEngine — the gRPC boundary between the Go gateway and the
+// Python inference worker.  Two operational modes:
+//   1. FastTranscribe  – synchronous, low-latency streaming
+//   2. SubmitBatchJob  – asynchronous, long-form file processing
+service ScribeEngine {
+  // Fast Mode: client streams AudioChunks, worker returns a single response
+  // once the stream ends (client-to-server streaming RPC).
+  rpc FastTranscribe(stream AudioChunk) returns (TranscribeResponse);
+
+  // Batch Mode: submit metadata for a long-form file stored on S3/local.
+  // Returns immediately with a job_id.  Results are written back to Valkey.
+  rpc SubmitBatchJob(BatchJobRequest) returns (BatchJobResponse);
+}
+
+// A single chunk of raw audio bytes sent during FastTranscribe.
+message AudioChunk {
+  bytes data = 1;
+  // Model name that maps to the React UI dropdown and faster-whisper model
+  // sizes (e.g. "large-v3", "distil-large-v3", "base").
+  string model = 2;
+  // BCP-47 language hint (e.g. "en", "fr", "auto").  Empty = auto-detect.
+  string language = 3;
+  // Sample rate of the raw PCM audio (default: 16000).
+  int32 sample_rate = 4;
+}
+
+// Full transcription result returned by FastTranscribe.
+message TranscribeResponse {
+  string request_id = 1;
+  float duration_sec = 2;
+  TranscriptResult result = 3;
+}
+
+// Container for the transcript text and segments.
+message TranscriptResult {
+  string text_display = 1;
+  repeated Segment segments = 2;
+}
+
+// A single time-aligned segment of the transcript.
+message Segment {
+  float start = 1;
+  float end = 2;
+  string text = 3;
+  string speaker = 4;
+  float confidence = 5;
+}
+
+// Request to submit a batch processing job.
+message BatchJobRequest {
+  // S3 URI or local path to the audio file.
+  string input_uri = 1;
+  string model = 2;
+  string language = 3;
+  // Optional: callback URL to POST results when done.
+  string callback_url = 4;
+}
+
+// Acknowledgement returned immediately after job submission.
+message BatchJobResponse {
+  string job_id = 1;
+  string status = 2;  // "QUEUED"
+}
