@@ -631,7 +631,7 @@ def _gradio_transcribe(audio_path: str, model_name: str, language: str):
 
 _SERVER_MODELS = [k for k in SUPPORTED_MODELS.keys() if "/" not in k or k.startswith("ibm-") or k.startswith("openai/")]
 
-_SAMPLES_DIR = Path("/app/samples") if Path("/app/samples").exists() else Path("frontend/public/samples")
+_SAMPLES_DIR = Path("/app/samples") if Path("/app/samples").exists() else Path("samples")
 
 demo = gr.Interface(
     fn=_gradio_transcribe,
