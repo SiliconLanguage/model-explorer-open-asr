@@ -666,8 +666,6 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
-app = gr.mount_gradio_app(app, demo, path="/")
-
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -1206,3 +1204,9 @@ async def transcribe_stream(
         yield f"data: {final_payload}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Mount Gradio UI AFTER all FastAPI routes so it doesn't shadow them
+# ---------------------------------------------------------------------------
+app = gr.mount_gradio_app(app, demo, path="/")
