@@ -30,6 +30,7 @@ services:
       - OPENASR_VLLM_ENFORCE_EAGER=${OPENASR_VLLM_ENFORCE_EAGER:-true}
       - ALLOW_MOCK_FALLBACK=${ALLOW_MOCK_FALLBACK:-false}
       - ASR_ENGINE=${ASR_ENGINE:-hf}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
     # GPU access – requires the NVIDIA Container Toolkit.
     # Remove the `deploy` block entirely if running CPU-only.
     deploy:

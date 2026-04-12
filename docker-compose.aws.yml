@@ -1,0 +1,70 @@
+# ── AWS g5.2xlarge Production Compose ─────────────────────────────────────────
+# Usage:
+#   cp .env.aws .env          # configure secrets + engine choice
+#   docker compose -f docker-compose.aws.yml up --build -d
+#
+# Instance: g5.2xlarge — 1× NVIDIA A10G (24 GB), 8 vCPU, 32 GB RAM
+# Stack: FastAPI backend (port 8000) + Nginx frontend (port 80)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── FastAPI ASR backend (CUDA) ──────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    expose:
+      - "8000"
+    volumes:
+      - hf_cache:/hf_cache
+    environment:
+      - HF_HOME=/hf_cache
+      - TRANSFORMERS_CACHE=/hf_cache
+      - HF_TOKEN=${HF_TOKEN}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
+      - OPENASR_ENGINE_INIT_TIMEOUT_S=${OPENASR_ENGINE_INIT_TIMEOUT_S:-180}
+      - OPENASR_VLLM_MAX_MODEL_LEN=${OPENASR_VLLM_MAX_MODEL_LEN:-8192}
+      - OPENASR_VLLM_ENFORCE_EAGER=${OPENASR_VLLM_ENFORCE_EAGER:-true}
+      - ALLOW_MOCK_FALLBACK=${ALLOW_MOCK_FALLBACK:-false}
+      - ASR_ENGINE=${ASR_ENGINE:-faster_whisper}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Nginx reverse proxy + React SPA ────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hf_cache:
