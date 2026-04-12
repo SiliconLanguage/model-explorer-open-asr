@@ -18,10 +18,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir --upgrade pip \
     && python3 -m pip install --no-cache-dir -r /app/requirements.txt \
-    && python3 -m pip install --no-cache-dir --no-deps gradio==5.49.1 \
-    && python3 -m pip install --no-cache-dir gradio-client safehttpx tomlkit semantic-version \
-       aiofiles orjson python-multipart ruff typer huggingface-hub packaging pillow \
-       markupsafe jinja2
+    && python3 -m pip install --no-cache-dir --no-deps vllm==0.19.0
 
 COPY backend/app.py /app/app.py
 
