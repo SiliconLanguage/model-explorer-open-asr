@@ -29,7 +29,6 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import gradio as gr
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -206,12 +205,32 @@ GPU_MEMORY_UTILIZATION = _read_float_env("GPU_MEMORY_UTILIZATION", 0.4)
 VLLM_MAX_MODEL_LEN = _read_int_env("OPENASR_VLLM_MAX_MODEL_LEN", 8192)
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 VLLM_ENFORCE_EAGER = _read_bool_env("OPENASR_VLLM_ENFORCE_EAGER", True)
-ENGINE_CHOICES = {"vllm", "hf-gpu", "hf-cpu"}
+
+# ---------------------------------------------------------------------------
+# ASR_ENGINE – selects the inference backend
+#   "hf"             → HuggingFace transformers pipeline (default, legacy)
+#   "faster_whisper"  → CTranslate2-backed faster-whisper (optimised for A10G)
+#   "vllm"            → vLLM AsyncLLMEngine (production, requires compatible GPU)
+# ---------------------------------------------------------------------------
+ASR_ENGINE = os.getenv("ASR_ENGINE", "hf").strip().lower()
+_VALID_ASR_ENGINES = {"hf", "faster_whisper", "vllm"}
+if ASR_ENGINE not in _VALID_ASR_ENGINES:
+    logger.warning("Invalid ASR_ENGINE=%r; falling back to 'hf'. Valid: %s", ASR_ENGINE, sorted(_VALID_ASR_ENGINES))
+    ASR_ENGINE = "hf"
+logger.info("ASR_ENGINE=%s", ASR_ENGINE)
+
+ENGINE_CHOICES = {"vllm", "hf-gpu", "hf-cpu", "faster_whisper"}
 
 
 def _normalize_engine(engine: str | None) -> str:
+    """Resolve the per-request engine, defaulting to ASR_ENGINE global."""
     if engine is None:
-        return "vllm"
+        # Map the global ASR_ENGINE to a per-request engine mode
+        if ASR_ENGINE == "faster_whisper":
+            return "faster_whisper"
+        if ASR_ENGINE == "vllm":
+            return "vllm"
+        return "hf-gpu" if torch.cuda.is_available() else "hf-cpu"
     value = engine.strip().lower()
     if value not in ENGINE_CHOICES:
         raise HTTPException(
@@ -380,6 +399,125 @@ async def _get_best_hf_pipeline_async(model_key: str):
     if pipeline_cpu is not None:
         return pipeline_cpu, "hf-cpu"
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# faster-whisper (CTranslate2) engine
+# ---------------------------------------------------------------------------
+
+# Map our model keys to faster-whisper model sizes
+_FASTER_WHISPER_SIZE_MAP: dict[str, str] = {
+    "openai/whisper-base": "base",
+    "openai/whisper-small": "small",
+    "openai/whisper-medium": "medium",
+    "openai/whisper-large-v3": "large-v3",
+}
+
+
+class _FasterWhisperWrapper:
+    """Thin wrapper holding a faster_whisper.WhisperModel."""
+    def __init__(self, model, model_size: str):
+        self.model = model
+        self.model_size = model_size
+
+
+def _build_faster_whisper(model_key: str) -> _FasterWhisperWrapper:
+    """Load a faster-whisper CTranslate2 model on CUDA with float16."""
+    from faster_whisper import WhisperModel
+
+    model_size = _FASTER_WHISPER_SIZE_MAP.get(model_key, "base")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    logger.info("Loading faster-whisper model '%s' on %s (%s)…", model_size, device, compute_type)
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    return _FasterWhisperWrapper(model, model_size)
+
+
+def _get_faster_whisper(model_key: str) -> _FasterWhisperWrapper | None:
+    """Return (or lazily create) a faster-whisper model for *model_key*."""
+    cache_key = _model_manager._cache_key(model_key, "faster_whisper")
+    if (
+        _model_manager.current_model_id == model_key
+        and _model_manager.current_engine_mode == "faster_whisper"
+    ):
+        return _model_manager._engine
+    if cache_key in _model_manager._failed:
+        return None
+
+    if _model_manager._needs_swap(model_key, "faster_whisper"):
+        _model_manager.purge()
+
+    try:
+        wrapper = _build_faster_whisper(model_key)
+        _model_manager._engine = wrapper
+        _model_manager.current_model_id = model_key
+        _model_manager.current_engine_mode = "faster_whisper"
+        _model_manager._engine_type = "faster_whisper"
+        logger.info("faster-whisper ready for %s (%s)", model_key, wrapper.model_size)
+        return wrapper
+    except Exception as exc:
+        _model_manager._failed.add(cache_key)
+        logger.warning("faster-whisper init failed for %s: %s", model_key, exc)
+        return None
+
+
+async def _get_faster_whisper_async(
+    model_key: str, timeout_s: float = ENGINE_INIT_TIMEOUT_S
+) -> _FasterWhisperWrapper | None:
+    if (
+        _model_manager.current_model_id == model_key
+        and _model_manager.current_engine_mode == "faster_whisper"
+    ):
+        return _model_manager._engine
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_get_faster_whisper, model_key),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("faster-whisper init timed out for %s after %.1fs.", model_key, timeout_s)
+        return None
+
+
+async def _run_faster_whisper(
+    wrapper: _FasterWhisperWrapper, waveform: np.ndarray, language: str = "en"
+) -> tuple[str, float, float]:
+    """Run faster-whisper inference; return (transcript, ttft_ms, mean_itl_ms)."""
+    request_start = time.perf_counter()
+
+    def _run_sync():
+        segments, info = wrapper.model.transcribe(
+            waveform,
+            language=language if language != "auto" else None,
+            beam_size=5,
+            vad_filter=True,
+        )
+        texts = []
+        first_segment_time = None
+        for seg in segments:
+            if first_segment_time is None:
+                first_segment_time = time.perf_counter()
+            texts.append(seg.text)
+        return " ".join(texts).strip(), first_segment_time
+
+    try:
+        transcript, first_segment_time = await asyncio.to_thread(_run_sync)
+    except Exception as exc:
+        logger.warning("faster-whisper inference failed: %s", exc)
+        elapsed_ms = (time.perf_counter() - request_start) * 1000
+        return (
+            f"[faster-whisper] Inference failed: {exc}",
+            elapsed_ms,
+            0.0,
+        )
+
+    ttft_ms = (
+        (first_segment_time - request_start) * 1000
+        if first_segment_time is not None
+        else (time.perf_counter() - request_start) * 1000
+    )
+    total_ms = (time.perf_counter() - request_start) * 1000
+    return transcript, ttft_ms, 0.0
 
 
 def _get_engine(model_key: str):
@@ -562,7 +700,8 @@ class TranscribeResponse(BaseModel):
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Open-ASR Model Explorer backend starting up.")
     logger.info(
-        "Runtime config: gpu_memory_utilization=%.2f, max_model_len=%d, init_timeout=%.1fs, allow_mock_fallback=%s, enforce_eager=%s",
+        "Runtime config: ASR_ENGINE=%s, gpu_memory_utilization=%.2f, max_model_len=%d, init_timeout=%.1fs, allow_mock_fallback=%s, enforce_eager=%s",
+        ASR_ENGINE,
         GPU_MEMORY_UTILIZATION,
         VLLM_MAX_MODEL_LEN,
         ENGINE_INIT_TIMEOUT_S,
@@ -597,84 +736,7 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Gradio UI – mounted at / for HF Spaces iframe
-# ---------------------------------------------------------------------------
 
-def _gradio_transcribe(audio_path: str, model_name: str, engine: str, language: str):
-    """Synchronous wrapper called by Gradio – posts to the local FastAPI endpoint."""
-    import httpx
-
-    if not audio_path:
-        return "Please upload or record an audio file."
-
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    port = int(os.environ.get("PORT", "7860"))
-    resp = httpx.post(
-        f"http://127.0.0.1:{port}/transcribe",
-        files={"audio": ("audio.wav", audio_bytes, "audio/wav")},
-        data={"model": model_name, "engine": engine, "language": language},
-        timeout=120.0,
-    )
-    if resp.status_code != 200:
-        return f"Error {resp.status_code}: {resp.text}"
-    result = resp.json()
-    metrics = (
-        f"\n\n---\nTTFT: {result.get('ttft_ms', 'N/A')} ms  |  "
-        f"ITL: {result.get('itl_ms', 'N/A')} ms  |  "
-        f"RTFx: {result.get('rtfx', 'N/A')}"
-    )
-    return result.get("transcript", "") + metrics
-
-
-_SERVER_MODELS = [k for k in SUPPORTED_MODELS.keys() if "/" not in k or k.startswith("ibm-") or k.startswith("openai/")]
-
-_SAMPLES_DIR = Path("/app/samples") if Path("/app/samples").exists() else Path("samples")
-
-demo = gr.Interface(
-    fn=_gradio_transcribe,
-    inputs=[
-        gr.Audio(type="filepath", label="Upload or record audio"),
-        gr.Dropdown(
-            choices=list(SUPPORTED_MODELS.keys()),
-            value="openai/whisper-base",
-            label="Model",
-        ),
-        gr.Dropdown(
-            choices=["hf-gpu", "hf-cpu", "vllm"],
-            value="hf-gpu",
-            label="Engine",
-        ),
-        gr.Dropdown(
-            choices=["english", "chinese", "spanish", "french", "german",
-                     "japanese", "korean", "hindi", "arabic", "portuguese"],
-            value="english",
-            label="Language",
-        ),
-    ],
-    outputs=gr.Textbox(label="Transcript", lines=8),
-    title="Open-ASR Model Explorer",
-    description=(
-        "Hybrid inference testbed for open-source ASR models. "
-        "Upload audio or record from your microphone, pick a model and engine, then transcribe.\n\n"
-        "**Engine options:** `hf-gpu` (HuggingFace Transformers on GPU), "
-        "`hf-cpu` (CPU-only fallback), `vllm` (vLLM optimised serving).\n\n"
-        "**Note:** WebGPU client-side models (Xenova/whisper-*, onnx-community/cohere-*) "
-        "run in-browser via transformers.js and are available in the "
-        "[full React UI](https://github.com/SiliconLanguage/model-explorer-open-asr) only."
-    ),
-    examples=[
-        [str(_SAMPLES_DIR / "english.wav"), "openai/whisper-base", "hf-gpu", "english"],
-        [str(_SAMPLES_DIR / "chinese.wav"), "openai/whisper-base", "hf-gpu", "chinese"],
-        [str(_SAMPLES_DIR / "french.wav"), "openai/whisper-base", "hf-gpu", "french"],
-        [str(_SAMPLES_DIR / "spanish.wav"), "openai/whisper-base", "hf-gpu", "spanish"],
-        [str(_SAMPLES_DIR / "japanese.wav"), "openai/whisper-base", "hf-gpu", "japanese"],
-        [str(_SAMPLES_DIR / "hindi.wav"), "openai/whisper-base", "hf-gpu", "hindi"],
-    ],
-    flagging_mode="never",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -754,10 +816,19 @@ async def transcribe(
     waveform_padded = _pad_or_truncate(waveform)
 
     # ── 2. Run on the selected engine (no silent fallback) ────────────────────────
-    vllm_engine = await _get_engine_async(model) if selected_engine == "vllm" else None
     request_start = time.perf_counter()
 
-    if selected_engine == "vllm":
+    if selected_engine == "faster_whisper":
+        fw_model = await _get_faster_whisper_async(model)
+        if fw_model is not None:
+            transcript, ttft_ms, itl_ms = await _run_faster_whisper(fw_model, waveform_padded, iso_lang)
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail=f"faster-whisper engine failed to load for '{model}'. Check backend logs.",
+            )
+    elif selected_engine == "vllm":
+        vllm_engine = await _get_engine_async(model)
         if vllm_engine is not None:
             transcript, ttft_ms, itl_ms = await _run_vllm(vllm_engine, waveform_padded, model)
         else:
@@ -1093,29 +1164,40 @@ async def transcribe_stream(
 
     audio_duration_s = len(waveform) / TARGET_SR
     waveform_padded = _pad_or_truncate(waveform)
-    vllm_engine = await _get_engine_async(model) if selected_engine == "vllm" else None
-    hf_pipeline = None
-    if selected_engine in {"hf-gpu", "hf-cpu"}:
-        hf_pipeline = await _get_hf_pipeline_async(model, selected_engine)
 
-    if selected_engine == "vllm" and vllm_engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"vLLM engine failed to initialise for '{model}'. "
-                "On SM 12.0 (Blackwell) all attention backends segfault "
-                "due to Triton 3.6.0 bug. Select an HF-GPU variant or "
-                "deploy to a non-Blackwell cloud GPU."
-            ),
-        )
-    if selected_engine in {"hf-gpu", "hf-cpu"} and hf_pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Transformers engine '{selected_engine}' failed to load for '{model}'. "
-                "Check backend logs for details."
-            ),
-        )
+    # Pre-load engines based on selected_engine
+    fw_model = None
+    vllm_engine = None
+    hf_pipeline = None
+    if selected_engine == "faster_whisper":
+        fw_model = await _get_faster_whisper_async(model)
+        if fw_model is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"faster-whisper engine failed to load for '{model}'. Check backend logs.",
+            )
+    elif selected_engine == "vllm":
+        vllm_engine = await _get_engine_async(model)
+        if vllm_engine is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"vLLM engine failed to initialise for '{model}'. "
+                    "On SM 12.0 (Blackwell) all attention backends segfault "
+                    "due to Triton 3.6.0 bug. Select an HF-GPU variant or "
+                    "deploy to a non-Blackwell cloud GPU."
+                ),
+            )
+    else:
+        hf_pipeline = await _get_hf_pipeline_async(model, selected_engine)
+        if hf_pipeline is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Transformers engine '{selected_engine}' failed to load for '{model}'. "
+                    "Check backend logs for details."
+                ),
+            )
 
     async def event_generator() -> AsyncGenerator[str, None]:
         import json
@@ -1125,7 +1207,31 @@ async def transcribe_stream(
         token_timestamps: list[float] = []
         full_text = ""
 
-        if vllm_engine is not None:
+        if fw_model is not None:
+            # faster-whisper: stream segment-by-segment
+            def _fw_segments():
+                segs, info = fw_model.model.transcribe(
+                    waveform_padded,
+                    language=iso_lang if iso_lang != "auto" else None,
+                    beam_size=5,
+                    vad_filter=True,
+                )
+                return list(segs)
+
+            segments = await asyncio.to_thread(_fw_segments)
+            for seg in segments:
+                now = time.perf_counter()
+                if first_token_time is None:
+                    first_token_time = now
+                    ttft_ms = (first_token_time - request_start) * 1000
+                    yield f"data: {json.dumps({'token': '', 'ttft_ms': round(ttft_ms, 2), 'done': False})}\n\n"
+                token_timestamps.append(now)
+                delta = seg.text.strip()
+                if delta:
+                    full_text += delta + " "
+                    yield f"data: {json.dumps({'token': delta + ' ', 'ttft_ms': None, 'done': False})}\n\n"
+
+        elif vllm_engine is not None:
             from vllm import SamplingParams  # type: ignore
 
             hf_model = SUPPORTED_MODELS.get(model, model)
@@ -1216,7 +1322,4 @@ async def transcribe_stream(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Mount Gradio UI AFTER all FastAPI routes so it doesn't shadow them
-# ---------------------------------------------------------------------------
-app = gr.mount_gradio_app(app, demo, path="/")
+

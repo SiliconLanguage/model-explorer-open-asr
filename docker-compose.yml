@@ -29,6 +29,7 @@ services:
       - OPENASR_VLLM_MAX_MODEL_LEN=${OPENASR_VLLM_MAX_MODEL_LEN:-8192}
       - OPENASR_VLLM_ENFORCE_EAGER=${OPENASR_VLLM_ENFORCE_EAGER:-true}
       - ALLOW_MOCK_FALLBACK=${ALLOW_MOCK_FALLBACK:-false}
+      - ASR_ENGINE=${ASR_ENGINE:-hf}
     # GPU access – requires the NVIDIA Container Toolkit.
     # Remove the `deploy` block entirely if running CPU-only.
     deploy:
