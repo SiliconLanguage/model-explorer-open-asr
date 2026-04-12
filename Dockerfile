@@ -21,6 +21,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
     && python3 -m pip install --no-cache-dir --no-deps vllm==0.19.0
 
 COPY backend/app.py /app/app.py
+COPY frontend/public/samples/ /app/samples/
 
 ENV HF_HOME=/data/.huggingface
 ENV TRANSFORMERS_CACHE=/data/.huggingface

@@ -631,6 +631,8 @@ def _gradio_transcribe(audio_path: str, model_name: str, language: str):
 
 _SERVER_MODELS = [k for k in SUPPORTED_MODELS.keys() if "/" not in k or k.startswith("ibm-") or k.startswith("openai/")]
 
+_SAMPLES_DIR = Path("/app/samples") if Path("/app/samples").exists() else Path("frontend/public/samples")
+
 demo = gr.Interface(
     fn=_gradio_transcribe,
     inputs=[
@@ -653,6 +655,14 @@ demo = gr.Interface(
         "Hybrid inference testbed for open-source ASR models. "
         "Upload audio or record from your microphone, pick a model, and transcribe."
     ),
+    examples=[
+        [str(_SAMPLES_DIR / "english.wav"), "openai/whisper-base", "english"],
+        [str(_SAMPLES_DIR / "chinese.wav"), "openai/whisper-base", "chinese"],
+        [str(_SAMPLES_DIR / "french.wav"), "openai/whisper-base", "french"],
+        [str(_SAMPLES_DIR / "spanish.wav"), "openai/whisper-base", "spanish"],
+        [str(_SAMPLES_DIR / "japanese.wav"), "openai/whisper-base", "japanese"],
+        [str(_SAMPLES_DIR / "hindi.wav"), "openai/whisper-base", "hindi"],
+    ],
     allow_flagging="never",
 )
 
