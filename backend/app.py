@@ -597,6 +597,16 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Root – HF Spaces iframe landing / health-check probe
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+async def root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/docs")
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
