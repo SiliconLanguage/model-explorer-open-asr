@@ -1278,8 +1278,6 @@ async def transcribe_stream(
             token_timestamps.append(time.perf_counter())
         else:
             # Mock streaming
-            import asyncio
-
             words = (
                 f"[Mock – {model}] Audio {audio_duration_s:.1f}s. "
                 "No GPU available."

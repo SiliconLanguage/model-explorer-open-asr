@@ -8,6 +8,7 @@
 const MODELS = [
   { value: 'whisper-base-hf-gpu', id: 'openai/whisper-base', label: 'Whisper Base (Server: HF-GPU Fast)', mode: 'server', engine: 'hf-gpu' },
   { value: 'whisper-base-hf-cpu', id: 'openai/whisper-base', label: 'Whisper Base (Server: HF-CPU Safe)', mode: 'server', engine: 'hf-cpu' },
+  { value: 'whisper-base-faster', id: 'openai/whisper-base', label: 'Whisper Base (faster-whisper CTranslate2)', mode: 'server', engine: 'faster_whisper' },
   { value: 'cohere-hf-gpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-GPU Safe)', mode: 'server', engine: 'hf-gpu' },
   { value: 'cohere-hf-cpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-CPU Safe)', mode: 'server', engine: 'hf-cpu' },
   { value: 'qwen3-asr-hf-gpu', id: 'Qwen3-ASR-1.7B', label: 'Qwen3-ASR 1.7B (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
@@ -22,6 +23,7 @@ const BADGE = {
   'vllm-server': { label: 'vLLM · Server-Side', color: '#4f46e5' },
   'hf-gpu-server': { label: 'HF GPU · Server-Side', color: '#2563eb' },
   'hf-cpu-server': { label: 'HF CPU · Server-Side', color: '#0f766e' },
+  'faster-whisper-server': { label: 'faster-whisper · Server-Side', color: '#7c3aed' },
   webgpu: { label: 'WebGPU · Client-Side', color: '#059669' },
 };
 
@@ -29,6 +31,7 @@ function modelBadge(model) {
   if (model.mode === 'webgpu') return BADGE.webgpu;
   if (model.engine === 'hf-gpu') return BADGE['hf-gpu-server'];
   if (model.engine === 'hf-cpu') return BADGE['hf-cpu-server'];
+  if (model.engine === 'faster_whisper') return BADGE['faster-whisper-server'];
   return BADGE['vllm-server'];
 }
 
@@ -41,6 +44,9 @@ function modelTitle(model) {
   }
   if (model.engine === 'hf-cpu') {
     return 'Routes audio to backend transformers on CPU';
+  }
+  if (model.engine === 'faster_whisper') {
+    return 'Routes audio to faster-whisper CTranslate2 engine';
   }
   return 'Routes audio to FastAPI/vLLM backend';
 }
