@@ -4,7 +4,7 @@ emoji: 🎙
 colorFrom: indigo
 colorTo: purple
 sdk: docker
-app_port: 8000
+app_port: 7860
 pinned: false
 ---
 
@@ -36,7 +36,7 @@ Set required values in `.env`:
 - `OPENASR_VLLM_MAX_MODEL_LEN=8192`
 - `OPENASR_VLLM_ENFORCE_EAGER=true` (recommended on WSL to avoid compile-path crashes)
 - `ALLOW_MOCK_FALLBACK=false` (recommended to avoid masking real backend failures)
-- `PORT=8000`
+- `PORT=7860` (for Hugging Face Spaces Docker runtime)
 
 ### 2) Start the Full Stack
 
@@ -244,7 +244,8 @@ The UI will be available at `http://localhost:3000` and the API at `http://local
 2. Create a new Space at [huggingface.co/new-space](https://huggingface.co/new-space) with the **Docker** SDK.
 3. Set the following Space secrets:
    - `HF_TOKEN` – your Hugging Face token (for gated model downloads)
-4. Push your fork – Spaces will automatically build the Docker image and start the server.
+4. The Space Docker container exposes port `7860` (Hugging Face default).
+5. Push your fork – Spaces will automatically build the Docker image and start the server.
 
 [![Deploy to Hugging Face Spaces](https://huggingface.co/datasets/huggingface/badges/resolve/main/deploy-to-spaces-lg.svg)](https://huggingface.co/spaces)
 
