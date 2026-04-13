@@ -7,24 +7,48 @@
  * Calls onAudioReady(File) when audio is available.
  */
 
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 
 const SUPPORTED_TYPES = ['audio/wav', 'audio/mpeg', 'audio/ogg', 'audio/flac', 'audio/webm'];
 
-export default function AudioRecorder({ onAudioReady, disabled, externalAudioUrl }) {
+export default function AudioRecorder({ onAudioReady, onFilesStaged, disabled, externalAudioUrl }) {
   const [recording, setRecording] = useState(false);
   const [audioUrl, setAudioUrl] = useState(null);
   const [fileName, setFileName] = useState(null);
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const isInternalChange = useRef(false);
+
+  // Clear internal state when external audio (sample clip) is selected,
+  // but not when the change was triggered by our own upload.
+  useEffect(() => {
+    if (externalAudioUrl) {
+      if (isInternalChange.current) {
+        isInternalChange.current = false;
+        return;
+      }
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      setAudioUrl(null);
+      setFileName(null);
+    }
+  }, [externalAudioUrl]);
 
   // ── File upload ────────────────────────────────────────────────────────────
   function handleFileChange(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setFileName(file.name);
-    setAudioUrl(URL.createObjectURL(file));
-    onAudioReady(file);
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    // Stage all selected files (no immediate submission)
+    if (onFilesStaged) {
+      onFilesStaged(Array.from(files));
+    }
+    setFileName(files.length === 1 ? files[0].name : `${files.length} files staged`);
+
+    // Set the first file as active audio for playback / single Transcribe
+    const first = files[0];
+    setAudioUrl(URL.createObjectURL(first));
+    isInternalChange.current = true;
+    onAudioReady(first);
   }
 
   // ── Microphone recording ───────────────────────────────────────────────────
@@ -45,11 +69,17 @@ export default function AudioRecorder({ onAudioReady, disabled, externalAudioUrl
       recorder.addEventListener('stop', () => {
         stream.getTracks().forEach((t) => t.stop());
         const blob = new Blob(chunksRef.current, { type: mimeType });
-        const file = new File([blob], 'recording.webm', { type: mimeType });
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const recName = `recording_${ts}.webm`;
+        const file = new File([blob], recName, { type: mimeType });
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
-        setFileName('recording.webm');
+        setFileName(recName);
         onAudioReady(file);
+        // Stage the recording (user clicks "Submit" in the staged files panel)
+        if (onFilesStaged) {
+          onFilesStaged([file]);
+        }
       });
 
       recorder.start(100); // collect data every 100 ms
@@ -75,6 +105,7 @@ export default function AudioRecorder({ onAudioReady, disabled, externalAudioUrl
           <input
             type="file"
             accept={SUPPORTED_TYPES.join(',')}
+            multiple
             onChange={handleFileChange}
             disabled={disabled || recording}
             style={{ display: 'none' }}

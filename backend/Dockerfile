@@ -38,6 +38,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir --upgrade "pip<26" \
 
 # ── Copy application source ───────────────────────────────────────────────────
 COPY app.py .
+COPY worker.py .
 
 # ── Runtime environment variables ─────────────────────────────────────────────
 # vLLM: disable usage statistics ping

@@ -18,12 +18,20 @@ const SAMPLES = [
   { name: 'hindi', label: '🇮🇳 Hindi', file: '/samples/hindi.wav' },
 ];
 
-export default function SampleClips({ onSampleSelect, disabled }) {
+const SAMPLE_FILENAMES = new Set(SAMPLES.map(s => s.file.split('/').pop()));
+
+export default function SampleClips({ onSampleSelect, onLoadingChange, disabled, audioFile }) {
   const [loading, setLoading] = useState(null);
   const [selected, setSelected] = useState(null);
 
+  // Clear highlight when the audio source is no longer one of our samples
+  // (e.g. user uploaded a file or recorded audio)
+  const isFromSample = audioFile && SAMPLE_FILENAMES.has(audioFile.name);
+  const activeSelection = isFromSample ? selected : null;
+
   async function handleClick(sample) {
     setLoading(sample.name);
+    onLoadingChange?.(true);
     try {
       const response = await fetch(sample.file);
       if (!response.ok) throw new Error(`Failed to fetch ${sample.file}`);
@@ -44,6 +52,7 @@ export default function SampleClips({ onSampleSelect, disabled }) {
       console.error('Sample clip load failed:', err);
     } finally {
       setLoading(null);
+      onLoadingChange?.(false);
     }
   }
 
@@ -54,7 +63,7 @@ export default function SampleClips({ onSampleSelect, disabled }) {
         {SAMPLES.map((s) => (
           <button
             key={s.name}
-            className={`btn ${selected === s.name ? 'btn-sample-active' : 'btn-secondary'}`}
+            className={`btn ${activeSelection === s.name ? 'btn-sample-active' : 'btn-secondary'}`}
             onClick={() => handleClick(s)}
             disabled={disabled || loading !== null}
           >

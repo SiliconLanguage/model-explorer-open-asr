@@ -6,14 +6,13 @@
  */
 
 const MODELS = [
-  { value: 'whisper-base-hf-gpu', id: 'openai/whisper-base', label: 'Whisper Base (Server: HF-GPU Fast)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'whisper-base-hf-cpu', id: 'openai/whisper-base', label: 'Whisper Base (Server: HF-CPU Safe)', mode: 'server', engine: 'hf-cpu' },
+  { value: 'whisper-base-hf-gpu', id: 'openai/whisper-base', label: 'Whisper Base (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'whisper-base-hf-cpu', id: 'openai/whisper-base', label: 'Whisper Base (HF-CPU)', mode: 'server', engine: 'hf-cpu' },
   { value: 'whisper-base-faster', id: 'openai/whisper-base', label: 'Whisper Base (faster-whisper CTranslate2)', mode: 'server', engine: 'faster_whisper' },
-  { value: 'cohere-hf-gpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-GPU Safe)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'cohere-hf-cpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-CPU Safe)', mode: 'server', engine: 'hf-cpu' },
+  { value: 'cohere-hf-gpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'cohere-hf-cpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-CPU)', mode: 'server', engine: 'hf-cpu' },
   { value: 'qwen3-asr-hf-gpu', id: 'Qwen3-ASR-1.7B', label: 'Qwen3-ASR 1.7B (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
   { value: 'granite-hf-gpu', id: 'ibm-granite/granite-4.0-1b-speech', label: 'Granite 4.0 1B Speech (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'granite-vllm', id: 'ibm-granite/granite-4.0-1b-speech', label: 'Granite 4.0 1B Speech (vLLM Cloud)', mode: 'server', engine: 'vllm' },
   { value: 'whisper-tiny-webgpu', id: 'Xenova/whisper-tiny', label: 'Whisper Tiny (WebGPU Safe)', mode: 'webgpu' },
   { value: 'whisper-base-webgpu', id: 'Xenova/whisper-base', label: 'Whisper Base (WebGPU - Unstable)', mode: 'webgpu' },
   { value: 'cohere-webgpu', id: 'onnx-community/cohere-transcribe-03-2026-ONNX', label: 'cohere-transcribe-03-2026 (WebGPU)', mode: 'webgpu' },

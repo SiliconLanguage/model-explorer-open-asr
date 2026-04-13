@@ -10,6 +10,23 @@
 
 services:
 
+  # ── Caddy reverse-proxy / TLS termination ───────────────────────────────────
+  gateway:
+    image: caddy:2-alpine
+    container_name: asr-gateway
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 / QUIC
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
   # ── FastAPI + vLLM backend ──────────────────────────────────────────────────
   backend:
     build:
@@ -20,6 +37,8 @@ services:
     volumes:
       # Persist downloaded HuggingFace model weights across container restarts.
       - hf_cache:/hf_cache
+      # Shared audio spool for async job ingestion.
+      - audio_spool:/data/audio_spool
     environment:
       - HF_HOME=/hf_cache
       - TRANSFORMERS_CACHE=/hf_cache
@@ -31,6 +50,15 @@ services:
       - ALLOW_MOCK_FALLBACK=${ALLOW_MOCK_FALLBACK:-false}
       - ASR_ENGINE=${ASR_ENGINE:-hf}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
+      # Valkey connection for async job queue
+      - VALKEY_HOST=valkey
+      - VALKEY_PORT=6379
+      - SPOOL_DIR=/data/audio_spool
+      # NCCL fixes for AWS EC2 (P2P/IB disabled on single-GPU instances)
+      - NCCL_P2P_DISABLE=1
+      - NCCL_IB_DISABLE=1
+      # vLLM debug logging to capture silent core crashes
+      - VLLM_LOG_LEVEL=DEBUG
     # GPU access – requires the NVIDIA Container Toolkit.
     # Remove the `deploy` block entirely if running CPU-only.
     deploy:
@@ -60,6 +88,64 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Valkey (Redis-compatible) job queue ─────────────────────────────────────
+  valkey:
+    image: valkey/valkey:8.1
+    ports:
+      - "6379:6379"
+    command: >
+      valkey-server
+        --save 60 1000
+        --loglevel notice
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Background inference worker (faster-whisper on GPU) ─────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "worker.py"]
+    volumes:
+      - hf_cache:/hf_cache
+      - audio_spool:/data/audio_spool
+    environment:
+      - HF_HOME=/hf_cache
+      - TRANSFORMERS_CACHE=/hf_cache
+      - VALKEY_HOST=valkey
+      - VALKEY_PORT=6379
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE=int8_float16
+      - NUM_WORKERS=4
+      - SPOOL_DIR=/data/audio_spool
+    depends_on:
+      valkey:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
 volumes:
   # Named volume for HuggingFace model weight cache.
   hf_cache:
+  # Caddy TLS certificates and ACME state.
+  caddy_data:
+  caddy_config:
+  # Valkey persistence.
+  valkey_data:
+  # Shared audio spool between backend and worker.
+  audio_spool:

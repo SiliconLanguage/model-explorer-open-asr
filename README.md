@@ -32,11 +32,9 @@ Set required values in `.env`:
 
 - `HF_TOKEN` — required for gated server-side models (for example Cohere and Granite)
 - `GPU_MEMORY_UTILIZATION=0.65` (start conservative; tune upward once stable)
-- `OPENASR_ENGINE_INIT_TIMEOUT_S=120` (first cold boot may include compilation)
-- `OPENASR_VLLM_MAX_MODEL_LEN=8192`
-- `OPENASR_VLLM_ENFORCE_EAGER=true` (recommended on WSL to avoid compile-path crashes)
-- `ALLOW_MOCK_FALLBACK=false` (recommended to avoid masking real backend failures)
-- `PORT=7860` (for Hugging Face Spaces Docker runtime)
+- `WHISPER_MODEL=large-v3` (worker model size: `large-v3`, `medium`, `small`, `base`)
+- `NUM_WORKERS=4` (parallel GPU inference threads in the worker)
+- `CORS_ALLOWED_ORIGIN=*` (lock to domain in production)
 
 ### 2) Start the Full Stack
 
@@ -44,67 +42,91 @@ Set required values in `.env`:
 docker compose up --build
 ```
 
-Frontend is served on `http://localhost:3000` and backend API on `http://localhost:8000`.
+This launches five services:
 
-### 3) Agent Protocol
+| Service | Role | Port |
+|---|---|---|
+| **gateway** | Caddy reverse-proxy, TLS termination | `:80` / `:443` |
+| **frontend** | React SPA + Nginx API proxy | `:3000` → Nginx `:80` |
+| **backend** | FastAPI — job enqueue, audio normalisation, REST API | `:8000` |
+| **valkey** | Valkey (Redis-compatible) job queue + hash store | `:6379` |
+| **worker** | faster-whisper GPU inference (BLPOP consumer) | — |
 
-When infrastructure or documentation changes, follow this protocol:
+Frontend: `http://localhost:3000` · Backend API: `http://localhost:8000` · Swagger: `http://localhost:8000/docs`
 
-- `/sync-infrastructure` — sync deployment documentation from `docker-compose.yml` and `nginx.conf` into the AgentWiki topology docs.
-- `/document-logic` — analyze implementation logic and update conceptual docs (for example LocalAgreement-2 behavior and router integration).
+### 3) Running Services Individually
 
-### Verification Checklist
+```bash
+# Backend + Valkey + Worker only (headless API mode)
+docker compose up --build backend valkey worker
 
-- [ ] **WebGPU**: WebGPU models run client-side and stream stable/unstable transcript updates in the UI.
-- [ ] **Streaming**: Server-side SSE path streams token updates continuously without proxy buffering delays.
-- [ ] **vLLM**: Backend starts with expected scheduler/runtime settings and serves `/health` successfully.
+# Frontend only (requires healthy backend)
+docker compose up --build frontend
+```
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Browser (React/Vite)                 │
-│                                                         │
-│  ┌──────────────┐   Strategy Router   ┌──────────────┐  │
-│  │ Model Select │──────────────────►  │ InferRouter  │  │
-│  └──────────────┘                     └──────┬───────┘  │
-│                                              │          │
-│                           ┌──────────────────┴──────┐   │
-│                           │                         │   │
-│                    "WebGPU" in name?         else       │
-│                           │                         │   │
-│                    ┌──────▼──────┐        ┌────────▼─┐  │
-│                    │  WebWorker  │        │  fetch() │  │
-│                    │ (transforms │        │  SSE     │  │
-│                    │  .js ONNX)  │        └────┬─────┘  │
-│                    │ LocalAgrmt2 │             │        │
-│                    └──────┬──────┘             │        │
-│                           │                   │         │
-│  ┌────────────────────────▼───────────────────▼──────┐  │
-│  │              Metrics Dashboard                    │  │
-│  │          TTFT · ITL · RTFx                        │  │
-│  └───────────────────────────────────────────────────┘  │
-└──────────────────────────────┬──────────────────────────┘
-                               │ HTTP POST (multipart/SSE)
-                    ┌──────────▼──────────┐
-                    │   FastAPI Backend   │
-                    │                     │
-                    │  Audio Normaliser   │
-                    │  (pad/truncate 30s) │
-                    │         │           │
-                    │  ┌──────▼───────┐   │
-                    │  │  vLLM Engine │   │
-                    │  │  chunked     │   │
-                    │  │  prefill     │   │
-                    │  │  max_tokens  │   │
-                    │  │  =2048       │   │
-                    │  │  gpu_util    │   │
-                    │  │  =0.88       │   │
-                    │  └──────────────┘   │
-                    └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Browser (React / Vite)                         │
+│                                                                     │
+│  ┌──────────────┐   Strategy Router   ┌──────────────┐             │
+│  │ Model Select │──────────────────►  │ InferRouter  │             │
+│  └──────────────┘                     └──────┬───────┘             │
+│                                              │                     │
+│                           ┌──────────────────┴──────┐              │
+│                    "WebGPU" in name?          else                  │
+│                           │                         │              │
+│                    ┌──────▼──────┐       ┌──────────▼─────────┐    │
+│                    │  WebWorker  │       │ p-limit pool (8)   │    │
+│                    │ (ONNX +     │       │ micro-batch upload  │    │
+│                    │  LocalAg2)  │       │ + progress bar      │    │
+│                    └──────┬──────┘       └──────────┬─────────┘    │
+│                           │                         │              │
+│  ┌────────────────────────▼─────────────────────────▼────────────┐ │
+│  │  Metrics Dashboard: TTFT · ITL · RTFx  ·  Upload Progress    │ │
+│  │  Jobs Sidebar: Progress bar  ·  Status  ·  Playback          │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────┬─────────────────────────────────┘
+                                   │ HTTPS (Caddy TLS)
+                    ┌──────────────▼──────────────┐
+                    │        Caddy Gateway        │
+                    │  TLS · HTTP/3 · Routing     │
+                    └──────────────┬──────────────┘
+                                   │
+              ┌────────────────────┴────────────────────┐
+              │ /api/*                                  │ /*
+    ┌─────────▼──────────┐                   ┌──────────▼─────────┐
+    │     Nginx Proxy    │                   │   Nginx Static     │
+    │  (strips /api/)    │                   │   (React SPA)      │
+    └─────────┬──────────┘                   └────────────────────┘
+              │
+    ┌─────────▼──────────┐     ┌─────────────────┐     ┌──────────────────┐
+    │   FastAPI Backend  │────►│     Valkey       │◄────│  Worker (GPU)    │
+    │                    │     │  (job queue +    │     │  faster-whisper  │
+    │  • POST /transcribe│     │   hash store)    │     │  large-v3        │
+    │    /batch           │     │                 │     │                  │
+    │  • Audio normalize │     │  LPUSH ──► BLPOP│     │  ThreadPool(4)   │
+    │  • Job enqueue     │     │  HSET / HGETALL │     │  CUDA inference  │
+    │  • /jobs CRUD      │     │  EXPIRE 24h     │     │                  │
+    │  • /audio playback │     └─────────────────┘     │  Spool cleanup   │
+    └────────────────────┘                              └──────────────────┘
+              │
+    ┌─────────▼──────────┐
+    │  /data/audio_spool │  (Docker named volume, shared)
+    └────────────────────┘
 ```
+
+### Data Flow: Batch Upload (945 files)
+
+1. **Browser** splits files into micro-batches of 5 via `p-limit(8)` — max 8 concurrent HTTP requests
+2. **Nginx** proxies each `POST /api/transcribe/batch` → FastAPI (strips `/api/` prefix)
+3. **FastAPI** normalises audio to 16 kHz mono WAV, writes to `/data/audio_spool`, creates Valkey hash with 24h TTL, `LPUSH` job ID to queue
+4. **Worker** `BLPOP`s job IDs, runs faster-whisper inference in a thread pool, writes transcript + metrics back to Valkey hash
+5. **Frontend** polls `GET /jobs/{id}` for status updates, displays progress bar
+6. **Cleanup**: Spool files are deleted after successful transcription; Valkey hashes expire after 24h; orphan sweep runs on `DELETE /jobs`
 
 ### Strategy-Based Routing
 
@@ -145,14 +167,16 @@ For the full architectural decision record, see [ADR-001: vLLM vs. Hugging Face 
 
 ```
 model-explorer-open-asr/
-├── docker-compose.yml     # Full-stack orchestration (backend + frontend)
+├── docker-compose.yml        # 5-service orchestration (gateway, frontend, backend, valkey, worker)
+├── Caddyfile                 # Caddy reverse-proxy: TLS + API/UI routing
 ├── backend/
-│   ├── app.py             # FastAPI application with vLLM integration
-│   ├── requirements.txt   # Python dependencies
-│   └── Dockerfile         # CUDA 12.8 container image (Blackwell-compatible)
+│   ├── app.py                # FastAPI: job enqueue, audio normalisation, CRUD
+│   ├── worker.py             # BLPOP consumer: faster-whisper GPU inference
+│   ├── requirements.txt
+│   └── Dockerfile            # CUDA 12.8 (Blackwell-compatible)
 └── frontend/
-    ├── Dockerfile         # Multi-stage Vite build → Nginx serve
-    ├── nginx.conf         # Nginx: API proxy + SSE streaming + SPA fallback
+    ├── Dockerfile            # Multi-stage Vite build → Nginx serve
+    ├── nginx.conf            # API proxy + SSE streaming + SPA fallback
     ├── index.html
     ├── package.json
     ├── vite.config.js
@@ -163,12 +187,14 @@ model-explorer-open-asr/
         ├── components/
         │   ├── ModelSelector.jsx
         │   ├── AudioRecorder.jsx
+        │   ├── StagedFiles.jsx       # Staging area + upload progress bar
+        │   ├── JobsList.jsx           # Jobs sidebar + completion progress bar
         │   ├── MetricsDashboard.jsx
         │   └── TranscriptDisplay.jsx
         ├── services/
-        │   └── inferenceRouter.js   # Strategy-based routing logic
+        │   └── inferenceRouter.js    # Strategy routing + p-limit batch upload
         └── workers/
-            └── webgpu.worker.js     # transformers.js + LocalAgreement-2
+            └── webgpu.worker.js      # transformers.js + LocalAgreement-2
 ```
 
 ---
@@ -254,30 +280,41 @@ The UI will be available at `http://localhost:3000` and the API at `http://local
 ## API Reference
 
 ### `POST /transcribe`
-Upload audio for full (non-streaming) transcription.
-
-| Field | Type | Description |
-|---|---|---|
-| `audio` | `File` | Audio file (wav, mp3, ogg, flac, webm) |
-| `model` | `string` | Model key, e.g. `Qwen3-ASR-1.7B` |
-
-Response:
-```json
-{
-  "transcript": "Hello, world!",
-  "model": "Qwen3-ASR-1.7B",
-  "ttft_ms": 123.4,
-  "itl_ms": 8.2,
-  "rtfx": 4.56
-}
-```
+Synchronous full transcription (in-process HF pipeline).
 
 ### `POST /transcribe/stream`
 Same as above but returns **Server-Sent Events** with token-by-token streaming.
 
+### `POST /transcribe/async`
+Enqueue a single file for background transcription. Returns `{ job_id, status: "accepted" }`.
+
+### `POST /transcribe/batch`
+Enqueue multiple files. Returns `{ jobs: [{ id, filename }, ...] }`.
+
+### `GET /jobs?session_id=...`
+List all jobs scoped to a session.
+
+### `GET /jobs/{job_id}`
+Poll job status. Returns full hash: `status`, `transcript`, `segments`, `ttft_ms`, `itl_ms`, `processing_time_s`, ...
+
+### `DELETE /jobs?session_id=...`
+Delete all session jobs + sweep orphaned spool files.
+
+### `DELETE /jobs/{job_id}`
+Delete a single job and its spool file.
+
+### `POST /jobs/{job_id}/resubmit`
+Re-enqueue a completed/failed job.
+
+### `GET /models`
+List available models with metadata.
+
+### `GET /audio/{filename}`
+Serve audio from the spool directory (browser playback).
+
 ### `GET /health`
 Returns readiness details such as `status`, `mode`, `loaded_models`, and `failed_models`.
-`status=ok` means at least one real vLLM model is ready; `status=degraded` means no real model is currently serving.
+`status=ok` means at least one real model is ready; `status=degraded` means no real model is currently serving.
 
 ### `GET /models`
 Returns the list of available server-side model keys.
