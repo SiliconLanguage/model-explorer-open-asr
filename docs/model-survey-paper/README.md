@@ -1,10 +1,8 @@
 # Open-ASR Model Explorer: A Survey of State-of-the-Art Speech Recognition and Hybrid Inference Architectures
 
 ---
-
 Author: Ping Long, Chief Systems Architect, Lead Researcher, SiliconLanguage Foundry  
 *Contact: [LinkedIn](https://www.linkedin.com/in/pinglong) | [GitHub](https://github.com/ping-long-github) | plongpingl@gmail.com*
-
 ---
 
 ## Abstract
@@ -361,6 +359,7 @@ The future trajectory of ASR architectures points toward a more integrated "hybr
 \[108\] Fabian Hinsenkamp, "Keep up with the latest Architecture Patterns," BigTech Coach.  
 \[109\] Md. Nayeem et al., "Agentic Pipelines in Embedded Software Engineering: Emerging Practices and Challenges," arXiv:2601.10220v1.  
 \[110\] "Agentic Pipelines in Embedded Software Engineering: Emerging Practices and Challenges," Scribd.  
+
 ---
 
 *Copyright (c) 2026 SiliconLanguage Foundry. All rights reserved.*
