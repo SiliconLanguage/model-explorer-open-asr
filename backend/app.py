@@ -48,6 +48,7 @@ SUPPORTED_MODELS: dict[str, str] = {
     "Qwen3-ASR-1.7B": "Qwen/Qwen3-ASR-1.7B",
     "ibm-granite/granite-4.0-1b-speech": "ibm-granite/granite-4.0-1b-speech",
     "openai/whisper-base": "openai/whisper-base",
+    "microsoft/VibeVoice-ASR-HF": "microsoft/VibeVoice-ASR-HF",
 }
 
 # ---------------------------------------------------------------------------

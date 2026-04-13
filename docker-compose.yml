@@ -110,20 +110,22 @@ services:
   worker:
     build:
       context: ./backend
-      dockerfile: Dockerfile
-    command: ["python", "worker.py"]
+      dockerfile: Dockerfile.worker
     volumes:
       - hf_cache:/hf_cache
       - audio_spool:/data/audio_spool
     environment:
       - HF_HOME=/hf_cache
       - TRANSFORMERS_CACHE=/hf_cache
+      - HF_HUB_ENABLE_HF_TRANSFER=1
       - VALKEY_HOST=valkey
       - VALKEY_PORT=6379
+      - ASR_ENGINE=${ASR_ENGINE:-whisper}
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - WHISPER_DEVICE=cuda
       - WHISPER_COMPUTE=int8_float16
       - NUM_WORKERS=4
+      - VIBEVOICE_MODEL=${VIBEVOICE_MODEL:-microsoft/VibeVoice-ASR-HF}
       - SPOOL_DIR=/data/audio_spool
     depends_on:
       valkey:

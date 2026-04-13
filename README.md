@@ -209,6 +209,12 @@ model-explorer-open-asr/
 
 ---
 
+## Guides
+
+- **[Adding a New ASR Model](ADDING_MODELS.md)** — step-by-step for HF Transformers, Batch Worker, and WebGPU models
+
+---
+
 ## Local Development
 
 ### Prerequisites

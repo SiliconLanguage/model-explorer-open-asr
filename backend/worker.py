@@ -1,24 +1,30 @@
 """
 Scribe Background Worker
 ─────────────────────────────────────────────────────────────────────────────
-Consumes transcription jobs from Valkey (scribe:queue), runs faster-whisper
-inference on GPU via a ThreadPoolExecutor, and writes results back to Valkey.
+Consumes transcription jobs from Valkey (scribe:queue), runs ASR inference on
+GPU, and writes results back to Valkey.  Supports two engines selectable via
+the ASR_ENGINE environment variable:
+
+  • whisper     — faster-whisper (CTranslate2), ThreadPoolExecutor(NUM_WORKERS)
+  • vibevoice   — Microsoft VibeVoice-ASR-HF (9B, bfloat16), sequential (1 job)
 
 Job lifecycle:
   1. BLPOP scribe:queue → job_id
   2. Read metadata from scribe:job:{job_id}
   3. Set status → processing
-  4. Run faster_whisper inference in a thread (releases GIL for CUDA)
+  4. Run inference (threaded for whisper, sequential for vibevoice)
   5. Write transcript + set status → completed
   6. Delete source audio from /data/audio_spool
 
 Environment variables:
   VALKEY_HOST       — Valkey hostname (default: valkey)
   VALKEY_PORT       — Valkey port (default: 6379)
+  ASR_ENGINE        — whisper | vibevoice (default: whisper)
   WHISPER_MODEL     — faster-whisper model size (default: large-v3)
   WHISPER_DEVICE    — cuda | cpu (default: cuda)
   WHISPER_COMPUTE   — int8_float16 | float16 | int8 (default: int8_float16)
   NUM_WORKERS       — ThreadPoolExecutor size (default: 4)
+  VIBEVOICE_MODEL   — HF model ID (default: microsoft/VibeVoice-ASR-HF)
   SPOOL_DIR         — Audio spool directory (default: /data/audio_spool)
 """
 
@@ -44,10 +50,12 @@ logger = logging.getLogger(__name__)
 
 VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey")
 VALKEY_PORT = int(os.getenv("VALKEY_PORT", "6379"))
+ASR_ENGINE = os.getenv("ASR_ENGINE", "whisper").lower()
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8_float16")
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
+VIBEVOICE_MODEL = os.getenv("VIBEVOICE_MODEL", "microsoft/VibeVoice-ASR-HF")
 SPOOL_DIR = Path(os.getenv("SPOOL_DIR", "/data/audio_spool"))
 
 QUEUE_KEY = "scribe:queue"
@@ -58,6 +66,8 @@ SPOOL_MAX_AGE_S = 86400  # 24 hours — matches Valkey key TTL
 
 _shutdown = asyncio.Event()
 _model = None  # Lazy-loaded faster-whisper model (shared across threads)
+_vv_model = None  # Lazy-loaded VibeVoice model
+_vv_processor = None  # Lazy-loaded VibeVoice processor
 
 
 def _load_model():
@@ -92,6 +102,27 @@ def _get_valkey() -> redis.Redis:
         socket_connect_timeout=10,
         retry_on_timeout=True,
     )
+
+
+def _load_vibevoice_model():
+    """Load the VibeVoice-ASR model and processor once (sequential inference)."""
+    global _vv_model, _vv_processor
+    if _vv_model is not None:
+        return _vv_model, _vv_processor
+
+    import torch
+    from transformers import AutoProcessor, VibeVoiceAsrForConditionalGeneration
+
+    logger.info("Loading VibeVoice-ASR model=%s dtype=bfloat16", VIBEVOICE_MODEL)
+    t0 = time.perf_counter()
+    _vv_processor = AutoProcessor.from_pretrained(VIBEVOICE_MODEL)
+    _vv_model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
+        VIBEVOICE_MODEL,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
+    )
+    logger.info("VibeVoice-ASR loaded in %.1fs on %s", time.perf_counter() - t0, _vv_model.device)
+    return _vv_model, _vv_processor
 
 
 # ── Inference (runs in ThreadPoolExecutor) ────────────────────────────────────
@@ -143,6 +174,64 @@ def _transcribe(audio_path: str, language: str | None) -> dict:
     }
 
 
+def _transcribe_vibevoice(audio_path: str, language: str | None) -> dict:
+    """
+    Run VibeVoice-ASR inference on a single audio file.
+    Returns the same dict shape as _transcribe() for Valkey compat.
+    The 9B model fills A10G 24 GB — runs sequentially (no thread pool).
+    """
+    import torch
+
+    model, processor = _load_vibevoice_model()
+
+    logger.debug("VibeVoice inference start: %s", audio_path)
+    t_start = time.perf_counter()
+
+    inputs = processor.apply_transcription_request(
+        audio=audio_path,
+    ).to(model.device, model.dtype)
+
+    ttft_t0 = time.perf_counter()
+    with torch.no_grad():
+        output_ids = model.generate(**inputs)
+    total_generate_ms = (time.perf_counter() - ttft_t0) * 1000
+
+    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+
+    # Structured output: list of {"Start", "End", "Speaker", "Content"}
+    parsed = processor.decode(generated_ids, return_format="parsed")[0]
+    plain = processor.decode(generated_ids, return_format="transcription_only")[0]
+
+    # Map VibeVoice structured output → Valkey segment format
+    seg_list = []
+    if isinstance(parsed, list):
+        for seg in parsed:
+            seg_list.append({
+                "start": round(float(seg.get("Start", 0)), 3),
+                "end": round(float(seg.get("End", 0)), 3),
+                "text": seg.get("Content", ""),
+                "speaker": seg.get("Speaker"),
+            })
+
+    # Duration from last segment end, or 0 if no segments
+    duration_s = seg_list[-1]["end"] if seg_list else 0.0
+
+    total_ms = (time.perf_counter() - t_start) * 1000
+    n_segments = len(seg_list)
+    # Approximate TTFT as generate time / number of output tokens (rough proxy)
+    ttft_ms = total_generate_ms if n_segments > 0 else None
+    itl_ms = (total_generate_ms / max(n_segments - 1, 1)) if n_segments > 1 else None
+
+    return {
+        "transcript": plain if isinstance(plain, str) else str(plain),
+        "segments": seg_list,
+        "duration_s": round(duration_s, 3),
+        "language_detected": "auto",
+        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+        "itl_ms": round(itl_ms, 1) if itl_ms is not None else None,
+    }
+
+
 # ── Job processing ────────────────────────────────────────────────────────────
 
 async def _process_job(
@@ -176,9 +265,13 @@ async def _process_job(
     # 3. Run inference in thread pool
     t0 = time.perf_counter()
     try:
-        result = await loop.run_in_executor(
-            pool, _transcribe, str(audio_path), language
-        )
+        if ASR_ENGINE == "vibevoice":
+            # VibeVoice runs sequentially (no thread pool) — 9B fills 24 GB
+            result = _transcribe_vibevoice(str(audio_path), language)
+        else:
+            result = await loop.run_in_executor(
+                pool, _transcribe, str(audio_path), language
+            )
     except Exception as exc:
         elapsed = time.perf_counter() - t0
         logger.error("Job %s: inference failed after %.1fs: %s", job_id, elapsed, exc)
@@ -253,14 +346,23 @@ def _sweep_orphan_spool_files(rconn: redis.Redis) -> None:
 
 async def _main() -> None:
     logger.info(
-        "Starting worker: model=%s, device=%s, compute=%s, num_workers=%d, spool=%s",
-        WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE, NUM_WORKERS, SPOOL_DIR,
+        "Starting worker: engine=%s, model=%s, device=%s, compute=%s, num_workers=%d, spool=%s",
+        ASR_ENGINE,
+        VIBEVOICE_MODEL if ASR_ENGINE == "vibevoice" else WHISPER_MODEL,
+        WHISPER_DEVICE, WHISPER_COMPUTE, NUM_WORKERS, SPOOL_DIR,
     )
 
-    # Pre-load model before accepting jobs
     loop = asyncio.get_running_loop()
-    pool = ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="whisper")
-    await loop.run_in_executor(pool, _load_model)
+
+    # Engine-specific setup: whisper uses a thread pool; vibevoice is sequential
+    if ASR_ENGINE == "vibevoice":
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vibevoice")
+        await loop.run_in_executor(pool, _load_vibevoice_model)
+        concurrency = 1
+    else:
+        pool = ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="whisper")
+        await loop.run_in_executor(pool, _load_model)
+        concurrency = NUM_WORKERS
 
     rconn = _get_valkey()
     logger.info("Connected to Valkey at %s:%d", VALKEY_HOST, VALKEY_PORT)
@@ -268,8 +370,8 @@ async def _main() -> None:
     # Sweep orphaned spool files from previous runs
     _sweep_orphan_spool_files(rconn)
 
-    # Semaphore limits concurrent GPU jobs to NUM_WORKERS
-    sem = asyncio.Semaphore(NUM_WORKERS)
+    # Semaphore limits concurrent GPU jobs
+    sem = asyncio.Semaphore(concurrency)
 
     async def _bounded_process(job_id: str) -> None:
         async with sem:
