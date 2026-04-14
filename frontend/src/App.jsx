@@ -1,6 +1,6 @@
 /**
  * App.jsx
- * Root component for the Open-ASR Model Explorer.
+ * Root component for the SiliconLanguage Open-ASR Model Explorer.
  *
  * Orchestrates:
  *   - Model selection (strategy-based routing)
@@ -433,7 +433,7 @@ export default function App() {
       <header className="app-header">
         <div className="header-title-row">
           <span className="header-icon">🎙</span>
-          <h1 className="header-title">SiliconLanguage Data Plane</h1>
+          <h1 className="header-title">SiliconLanguage Open-ASR Model Explorer</h1>
         </div>
         <p className="header-subtitle">
           High-Throughput Asynchronous ASR Pipeline · FastAPI &amp; Valkey Event-Driven Inference
@@ -563,7 +563,7 @@ export default function App() {
             <img src="/logo-lockup.png" alt="Silicon Language" className="footer-logo" />
           </a>
           <p>
-            SiliconLanguage Data Plane · Decoupled Queue-Driven Processing
+            SiliconLanguage Open-ASR Model Explorer · Decoupled Queue-Driven Processing
           </p>
         </div>
       </footer>
