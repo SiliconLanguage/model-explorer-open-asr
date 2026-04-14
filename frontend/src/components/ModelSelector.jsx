@@ -6,13 +6,13 @@
  */
 
 const MODELS = [
-  { value: 'whisper-base-hf-gpu', id: 'openai/whisper-base', label: 'Whisper Base (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'whisper-base-hf-cpu', id: 'openai/whisper-base', label: 'Whisper Base (HF-CPU)', mode: 'server', engine: 'hf-cpu' },
+  { value: 'whisper-base-hf-gpu', id: 'openai/whisper-base', label: 'Whisper Base (Server GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'whisper-base-hf-cpu', id: 'openai/whisper-base', label: 'Whisper Base (Server CPU)', mode: 'server', engine: 'hf-cpu' },
   { value: 'whisper-base-faster', id: 'openai/whisper-base', label: 'Whisper Base (faster-whisper CTranslate2)', mode: 'server', engine: 'faster_whisper' },
-  { value: 'cohere-hf-gpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'cohere-hf-cpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (HF-CPU)', mode: 'server', engine: 'hf-cpu' },
-  { value: 'qwen3-asr-hf-gpu', id: 'Qwen3-ASR-1.7B', label: 'Qwen3-ASR 1.7B (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
-  { value: 'granite-hf-gpu', id: 'ibm-granite/granite-4.0-1b-speech', label: 'Granite 4.0 1B Speech (HF-GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'cohere-hf-gpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (Server GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'cohere-hf-cpu', id: 'CohereLabs/cohere-transcribe-03-2026', label: 'cohere-transcribe-03-2026 (Server CPU)', mode: 'server', engine: 'hf-cpu' },
+  { value: 'qwen3-asr-hf-gpu', id: 'Qwen3-ASR-1.7B', label: 'Qwen3-ASR 1.7B (Server GPU)', mode: 'server', engine: 'hf-gpu' },
+  { value: 'granite-hf-gpu', id: 'ibm-granite/granite-4.0-1b-speech', label: 'Granite 4.0 1B Speech (Server GPU)', mode: 'server', engine: 'hf-gpu' },
   { value: 'vibevoice-asr', id: 'microsoft/VibeVoice-ASR-HF', label: 'VibeVoice-ASR 9B (Batch Worker)', mode: 'server', engine: 'vibevoice' },
   { value: 'whisper-tiny-webgpu', id: 'Xenova/whisper-tiny', label: 'Whisper Tiny (WebGPU Safe)', mode: 'webgpu' },
   { value: 'whisper-base-webgpu', id: 'Xenova/whisper-base', label: 'Whisper Base (WebGPU - Unstable)', mode: 'webgpu' },
@@ -20,9 +20,9 @@ const MODELS = [
 ];
 
 const BADGE = {
-  'vllm-server': { label: 'vLLM · Server-Side', color: '#4f46e5' },
-  'hf-gpu-server': { label: 'HF GPU · Server-Side', color: '#2563eb' },
-  'hf-cpu-server': { label: 'HF CPU · Server-Side', color: '#0f766e' },
+  'vllm-server': { label: 'Server Stream · Legacy', color: '#4f46e5' },
+  'hf-gpu-server': { label: 'Server GPU · API', color: '#2563eb' },
+  'hf-cpu-server': { label: 'Server CPU · API', color: '#0f766e' },
   'faster-whisper-server': { label: 'faster-whisper · Server-Side', color: '#7c3aed' },
   'vibevoice-server': { label: 'VibeVoice · Batch Worker', color: '#dc2626' },
   webgpu: { label: 'WebGPU · Client-Side', color: '#059669' },
@@ -53,7 +53,7 @@ function modelTitle(model) {
   if (model.engine === 'vibevoice') {
     return 'Microsoft VibeVoice-ASR 9B — speaker diarization + timestamps via batch worker';
   }
-  return 'Routes audio to FastAPI/vLLM backend';
+  return 'Routes audio to backend streaming engine';
 }
 
 export function getModelByValue(value) {

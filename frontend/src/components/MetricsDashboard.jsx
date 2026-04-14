@@ -22,9 +22,9 @@ const WEBGPU_VRAM_MAP = {
 /** Badge config for each engine type. */
 const ENGINE_BADGE = {
   webgpu:  { label: 'WebGPU',  color: '#059669' },
-  vllm:    { label: 'vLLM',    color: '#4f46e5' },
-  'hf-gpu': { label: 'HF-GPU', color: '#2563eb' },
-  'hf-cpu': { label: 'HF-CPU', color: '#0f766e' },
+  vllm:    { label: 'Server Stream', color: '#4f46e5' },
+  'hf-gpu': { label: 'Server GPU', color: '#2563eb' },
+  'hf-cpu': { label: 'Server CPU', color: '#0f766e' },
 };
 
 function MetricCard({ label, value, unit, description, highlight }) {
@@ -78,7 +78,7 @@ function FirstMetricCard({ engine, model, ttft_ms }) {
       label="LATENCY"
       value={ttft_ms != null ? ttft_ms.toFixed(1) : null}
       unit=" ms"
-      description="Total backend execution time (Hugging Face pipelines do not stream TTFT)"
+        description="Total backend execution time for non-streaming server pipeline paths"
     />
   );
 }

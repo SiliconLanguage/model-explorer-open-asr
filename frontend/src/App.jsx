@@ -433,10 +433,10 @@ export default function App() {
       <header className="app-header">
         <div className="header-title-row">
           <span className="header-icon">🎙</span>
-          <h1 className="header-title">Open-ASR Model Explorer</h1>
+          <h1 className="header-title">SiliconLanguage Data Plane</h1>
         </div>
         <p className="header-subtitle">
-          Hybrid inference testbed · vLLM server-side &amp; WebGPU client-side
+          High-Throughput Asynchronous ASR Pipeline · FastAPI &amp; Valkey Event-Driven Inference
         </p>
       </header>
 
@@ -563,14 +563,7 @@ export default function App() {
             <img src="/logo-lockup.png" alt="Silicon Language" className="footer-logo" />
           </a>
           <p>
-            Open-ASR Model Explorer ·{' '}
-            <a
-              href="https://huggingface.co/spaces"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              🤗 Hugging Face Spaces
-            </a>
+            SiliconLanguage Data Plane · Decoupled Queue-Driven Processing
           </p>
         </div>
       </footer>

@@ -228,6 +228,7 @@ model-explorer-open-asr/
 ## Guides
 
 - **[Adding a New ASR Model](ADDING_MODELS.md)** — step-by-step for HF Transformers, Batch Worker, and WebGPU models
+- **[ADR-001: Migrate ASR Inference Engine from vLLM to faster-whisper](docs/adr/ADR-001-migrate-asr-inference-from-vllm-to-faster-whisper.md)** — architectural decision and technical rationale
 - **[Production Readiness Roadmap](docs/production-readiness-roadmap.md)** — roadmap for transitioning Open-ASR to a resilient enterprise-grade service
 - **[Production Architecture Diagram](docs/diagrams/production-readiness-architecture.md)** — spoolless ingestion, HA queueing, multi-AZ workers, and control-plane observability
 
