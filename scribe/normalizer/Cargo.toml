@@ -1,0 +1,20 @@
+[package]
+name = "scribe-normalizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+symphonia = { version = "0.5", features = [
+    "aac", "mp3", "ogg", "wav", "flac", "pcm",
+] }
+rubato = "0.16"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -11,4 +11,15 @@ export default defineConfig({
       args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader'],
     },
   },
+  projects: [
+    {
+      name: 'full',
+      grep: /.*/,
+    },
+    {
+      name: 'dev',
+      grep: /@dev/,
+      timeout: 60_000,
+    },
+  ],
 });

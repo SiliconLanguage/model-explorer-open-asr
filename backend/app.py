@@ -11,15 +11,18 @@ from __future__ import annotations
 import gc
 import io
 import asyncio
+import json
 import time
 import os
 import logging
 import tempfile
+import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import numpy as np
+import redis
 import soundfile as sf
 import librosa
 import torch
@@ -27,9 +30,8 @@ from transformers import pipeline
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
-import gradio as gr
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,7 +48,28 @@ SUPPORTED_MODELS: dict[str, str] = {
     "Qwen3-ASR-1.7B": "Qwen/Qwen3-ASR-1.7B",
     "ibm-granite/granite-4.0-1b-speech": "ibm-granite/granite-4.0-1b-speech",
     "openai/whisper-base": "openai/whisper-base",
+    "microsoft/VibeVoice-ASR-HF": "microsoft/VibeVoice-ASR-HF",
 }
+
+# ---------------------------------------------------------------------------
+# Valkey / async job queue
+# ---------------------------------------------------------------------------
+VALKEY_HOST = os.getenv("VALKEY_HOST", "valkey")
+VALKEY_PORT = int(os.getenv("VALKEY_PORT", "6379"))
+SPOOL_DIR = Path(os.getenv("SPOOL_DIR", "/data/audio_spool"))
+QUEUE_KEY = "scribe:queue"
+JOB_PREFIX = "scribe:job:"
+
+
+def _get_valkey() -> redis.Redis:
+    """Create a Valkey client (redis-py is wire-compatible)."""
+    return redis.Redis(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        decode_responses=True,
+        socket_connect_timeout=5,
+    )
+
 
 # Target sample rate expected by Whisper-style models
 TARGET_SR = 16_000
@@ -206,12 +229,32 @@ GPU_MEMORY_UTILIZATION = _read_float_env("GPU_MEMORY_UTILIZATION", 0.4)
 VLLM_MAX_MODEL_LEN = _read_int_env("OPENASR_VLLM_MAX_MODEL_LEN", 8192)
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 VLLM_ENFORCE_EAGER = _read_bool_env("OPENASR_VLLM_ENFORCE_EAGER", True)
-ENGINE_CHOICES = {"vllm", "hf-gpu", "hf-cpu"}
+
+# ---------------------------------------------------------------------------
+# ASR_ENGINE – selects the inference backend
+#   "hf"             → HuggingFace transformers pipeline (default, legacy)
+#   "faster_whisper"  → CTranslate2-backed faster-whisper (optimised for A10G)
+#   "vllm"            → vLLM AsyncLLMEngine (production, requires compatible GPU)
+# ---------------------------------------------------------------------------
+ASR_ENGINE = os.getenv("ASR_ENGINE", "hf").strip().lower()
+_VALID_ASR_ENGINES = {"hf", "faster_whisper", "vllm"}
+if ASR_ENGINE not in _VALID_ASR_ENGINES:
+    logger.warning("Invalid ASR_ENGINE=%r; falling back to 'hf'. Valid: %s", ASR_ENGINE, sorted(_VALID_ASR_ENGINES))
+    ASR_ENGINE = "hf"
+logger.info("ASR_ENGINE=%s", ASR_ENGINE)
+
+ENGINE_CHOICES = {"vllm", "hf-gpu", "hf-cpu", "faster_whisper"}
 
 
 def _normalize_engine(engine: str | None) -> str:
+    """Resolve the per-request engine, defaulting to ASR_ENGINE global."""
     if engine is None:
-        return "vllm"
+        # Map the global ASR_ENGINE to a per-request engine mode
+        if ASR_ENGINE == "faster_whisper":
+            return "faster_whisper"
+        if ASR_ENGINE == "vllm":
+            return "vllm"
+        return "hf-gpu" if torch.cuda.is_available() else "hf-cpu"
     value = engine.strip().lower()
     if value not in ENGINE_CHOICES:
         raise HTTPException(
@@ -382,6 +425,125 @@ async def _get_best_hf_pipeline_async(model_key: str):
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# faster-whisper (CTranslate2) engine
+# ---------------------------------------------------------------------------
+
+# Map our model keys to faster-whisper model sizes
+_FASTER_WHISPER_SIZE_MAP: dict[str, str] = {
+    "openai/whisper-base": "base",
+    "openai/whisper-small": "small",
+    "openai/whisper-medium": "medium",
+    "openai/whisper-large-v3": "large-v3",
+}
+
+
+class _FasterWhisperWrapper:
+    """Thin wrapper holding a faster_whisper.WhisperModel."""
+    def __init__(self, model, model_size: str):
+        self.model = model
+        self.model_size = model_size
+
+
+def _build_faster_whisper(model_key: str) -> _FasterWhisperWrapper:
+    """Load a faster-whisper CTranslate2 model on CUDA with float16."""
+    from faster_whisper import WhisperModel
+
+    model_size = _FASTER_WHISPER_SIZE_MAP.get(model_key, "base")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    logger.info("Loading faster-whisper model '%s' on %s (%s)…", model_size, device, compute_type)
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    return _FasterWhisperWrapper(model, model_size)
+
+
+def _get_faster_whisper(model_key: str) -> _FasterWhisperWrapper | None:
+    """Return (or lazily create) a faster-whisper model for *model_key*."""
+    cache_key = _model_manager._cache_key(model_key, "faster_whisper")
+    if (
+        _model_manager.current_model_id == model_key
+        and _model_manager.current_engine_mode == "faster_whisper"
+    ):
+        return _model_manager._engine
+    if cache_key in _model_manager._failed:
+        return None
+
+    if _model_manager._needs_swap(model_key, "faster_whisper"):
+        _model_manager.purge()
+
+    try:
+        wrapper = _build_faster_whisper(model_key)
+        _model_manager._engine = wrapper
+        _model_manager.current_model_id = model_key
+        _model_manager.current_engine_mode = "faster_whisper"
+        _model_manager._engine_type = "faster_whisper"
+        logger.info("faster-whisper ready for %s (%s)", model_key, wrapper.model_size)
+        return wrapper
+    except Exception as exc:
+        _model_manager._failed.add(cache_key)
+        logger.warning("faster-whisper init failed for %s: %s", model_key, exc)
+        return None
+
+
+async def _get_faster_whisper_async(
+    model_key: str, timeout_s: float = ENGINE_INIT_TIMEOUT_S
+) -> _FasterWhisperWrapper | None:
+    if (
+        _model_manager.current_model_id == model_key
+        and _model_manager.current_engine_mode == "faster_whisper"
+    ):
+        return _model_manager._engine
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_get_faster_whisper, model_key),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("faster-whisper init timed out for %s after %.1fs.", model_key, timeout_s)
+        return None
+
+
+async def _run_faster_whisper(
+    wrapper: _FasterWhisperWrapper, waveform: np.ndarray, language: str = "en"
+) -> tuple[str, float, float]:
+    """Run faster-whisper inference; return (transcript, ttft_ms, mean_itl_ms)."""
+    request_start = time.perf_counter()
+
+    def _run_sync():
+        segments, info = wrapper.model.transcribe(
+            waveform,
+            language=language if language != "auto" else None,
+            beam_size=5,
+            vad_filter=True,
+        )
+        texts = []
+        first_segment_time = None
+        for seg in segments:
+            if first_segment_time is None:
+                first_segment_time = time.perf_counter()
+            texts.append(seg.text)
+        return " ".join(texts).strip(), first_segment_time
+
+    try:
+        transcript, first_segment_time = await asyncio.to_thread(_run_sync)
+    except Exception as exc:
+        logger.warning("faster-whisper inference failed: %s", exc)
+        elapsed_ms = (time.perf_counter() - request_start) * 1000
+        return (
+            f"[faster-whisper] Inference failed: {exc}",
+            elapsed_ms,
+            0.0,
+        )
+
+    ttft_ms = (
+        (first_segment_time - request_start) * 1000
+        if first_segment_time is not None
+        else (time.perf_counter() - request_start) * 1000
+    )
+    total_ms = (time.perf_counter() - request_start) * 1000
+    return transcript, ttft_ms, 0.0
+
+
 def _get_engine(model_key: str):
     """Return (or lazily create) the vLLM AsyncLLMEngine for *model_key*."""
     cache_key = _model_manager._cache_key(model_key, "vllm")
@@ -401,33 +563,21 @@ def _get_engine(model_key: str):
         hf_model = SUPPORTED_MODELS[model_key]
         logger.info("Loading vLLM engine for %s (%s)…", model_key, hf_model)
 
+        # Only pass max_model_len if it wouldn't exceed the model's native limit.
+        # Cohere ASR has max_seq_len=1024; Granite has 128k (needs capping).
+        # Pass None to let vLLM auto-derive from the model config.
+        effective_max_model_len = VLLM_MAX_MODEL_LEN if VLLM_MAX_MODEL_LEN else None
+
         engine_args = AsyncEngineArgs(
             model=hf_model,
-            # ── Chunked prefill prevents long audio prefills from starving
-            #    decode steps of other in-flight requests.
             enable_chunked_prefill=True,
-            max_num_batched_tokens=512,
-            # ── Keep a safer default to avoid OOM on mid-range GPUs.
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-            # ── Let vLLM auto-derive max_model_len from the model config
-            #    so we don't exceed max_position_embeddings for any model.
+            max_model_len=effective_max_model_len,
             enforce_eager=VLLM_ENFORCE_EAGER,
-            # ── Required for models with custom modeling code (e.g. Cohere ASR).
             trust_remote_code=True,
-            # ── Limit audio encoder profiling to 1 item to reduce profiling
-            #    burden on constrained environments.
             limit_mm_per_prompt={"audio": 1},
-            # ── Skip encoder cache profiling — the forward pass during
-            #    profiling triggers segfaults on SM 12.0.
             skip_mm_profiling=True,
-            # ── Force FlashAttention 2 backend.  FA2 ships with sm_80 PTX
-            #    that the CUDA driver JIT-compiles for supported GPUs.
-            #    NOTE: All attention backends still segfault on SM 12.0
-            #    (Blackwell) due to Triton 3.6.0 ir.builder bug.  This
-            #    config is for non-Blackwell cloud deployments.
             attention_backend="FLASH_ATTN",
-            # ── Disable Triton-compiled custom fused kernels (norm_quant,
-            #    act_quant) that segfault on SM 12.0 via Triton 3.6.0 bug.
             compilation_config={"custom_ops": ["none"]},
         )
         engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -445,9 +595,11 @@ def _get_engine(model_key: str):
         return None
     except Exception as exc:
         _model_manager._failed.add(_model_manager._cache_key(model_key, "vllm"))
+        import traceback
         logger.warning(
-            "vLLM engine init failed (%s).",
+            "vLLM engine init failed (%s).\n%s",
             exc,
+            traceback.format_exc(),
         )
         return None
 
@@ -562,7 +714,8 @@ class TranscribeResponse(BaseModel):
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Open-ASR Model Explorer backend starting up.")
     logger.info(
-        "Runtime config: gpu_memory_utilization=%.2f, max_model_len=%d, init_timeout=%.1fs, allow_mock_fallback=%s, enforce_eager=%s",
+        "Runtime config: ASR_ENGINE=%s, gpu_memory_utilization=%.2f, max_model_len=%d, init_timeout=%.1fs, allow_mock_fallback=%s, enforce_eager=%s",
+        ASR_ENGINE,
         GPU_MEMORY_UTILIZATION,
         VLLM_MAX_MODEL_LEN,
         ENGINE_INIT_TIMEOUT_S,
@@ -588,93 +741,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origin = os.getenv("CORS_ALLOWED_ORIGIN", "*").strip()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten for production
+    allow_origins=[_cors_origin] if _cors_origin != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------------------------
-# Gradio UI – mounted at / for HF Spaces iframe
-# ---------------------------------------------------------------------------
 
-def _gradio_transcribe(audio_path: str, model_name: str, engine: str, language: str):
-    """Synchronous wrapper called by Gradio – posts to the local FastAPI endpoint."""
-    import httpx
-
-    if not audio_path:
-        return "Please upload or record an audio file."
-
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    port = int(os.environ.get("PORT", "7860"))
-    resp = httpx.post(
-        f"http://127.0.0.1:{port}/transcribe",
-        files={"audio": ("audio.wav", audio_bytes, "audio/wav")},
-        data={"model": model_name, "engine": engine, "language": language},
-        timeout=120.0,
-    )
-    if resp.status_code != 200:
-        return f"Error {resp.status_code}: {resp.text}"
-    result = resp.json()
-    metrics = (
-        f"\n\n---\nTTFT: {result.get('ttft_ms', 'N/A')} ms  |  "
-        f"ITL: {result.get('itl_ms', 'N/A')} ms  |  "
-        f"RTFx: {result.get('rtfx', 'N/A')}"
-    )
-    return result.get("transcript", "") + metrics
-
-
-_SERVER_MODELS = [k for k in SUPPORTED_MODELS.keys() if "/" not in k or k.startswith("ibm-") or k.startswith("openai/")]
-
-_SAMPLES_DIR = Path("/app/samples") if Path("/app/samples").exists() else Path("samples")
-
-demo = gr.Interface(
-    fn=_gradio_transcribe,
-    inputs=[
-        gr.Audio(type="filepath", label="Upload or record audio"),
-        gr.Dropdown(
-            choices=list(SUPPORTED_MODELS.keys()),
-            value="openai/whisper-base",
-            label="Model",
-        ),
-        gr.Dropdown(
-            choices=["hf-gpu", "hf-cpu", "vllm"],
-            value="hf-gpu",
-            label="Engine",
-        ),
-        gr.Dropdown(
-            choices=["english", "chinese", "spanish", "french", "german",
-                     "japanese", "korean", "hindi", "arabic", "portuguese"],
-            value="english",
-            label="Language",
-        ),
-    ],
-    outputs=gr.Textbox(label="Transcript", lines=8),
-    title="Open-ASR Model Explorer",
-    description=(
-        "Hybrid inference testbed for open-source ASR models. "
-        "Upload audio or record from your microphone, pick a model and engine, then transcribe.\n\n"
-        "**Engine options:** `hf-gpu` (HuggingFace Transformers on GPU), "
-        "`hf-cpu` (CPU-only fallback), `vllm` (vLLM optimised serving).\n\n"
-        "**Note:** WebGPU client-side models (Xenova/whisper-*, onnx-community/cohere-*) "
-        "run in-browser via transformers.js and are available in the "
-        "[full React UI](https://github.com/SiliconLanguage/model-explorer-open-asr) only."
-    ),
-    examples=[
-        [str(_SAMPLES_DIR / "english.wav"), "openai/whisper-base", "hf-gpu", "english"],
-        [str(_SAMPLES_DIR / "chinese.wav"), "openai/whisper-base", "hf-gpu", "chinese"],
-        [str(_SAMPLES_DIR / "french.wav"), "openai/whisper-base", "hf-gpu", "french"],
-        [str(_SAMPLES_DIR / "spanish.wav"), "openai/whisper-base", "hf-gpu", "spanish"],
-        [str(_SAMPLES_DIR / "japanese.wav"), "openai/whisper-base", "hf-gpu", "japanese"],
-        [str(_SAMPLES_DIR / "hindi.wav"), "openai/whisper-base", "hf-gpu", "hindi"],
-    ],
-    flagging_mode="never",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +783,15 @@ async def health() -> dict:
 
 @app.get("/models")
 async def list_models() -> dict:
-    return {"models": list(SUPPORTED_MODELS.keys())}
+    # De-duplicate alias entries (both short name and full HF id map to same repo)
+    seen = set()
+    models = []
+    for key, hf_id in SUPPORTED_MODELS.items():
+        if hf_id in seen:
+            continue
+        seen.add(hf_id)
+        models.append({"id": key, "name": key, "hf_id": hf_id})
+    return {"models": models}
 
 
 # ---------------------------------------------------------------------------
@@ -751,29 +836,41 @@ async def transcribe(
         raise HTTPException(status_code=422, detail=f"Cannot decode audio: {exc}") from exc
 
     audio_duration_s = len(waveform) / TARGET_SR
+    # Only vLLM needs fixed-shape tensors; faster-whisper and HF handle
+    # variable-length input and their VAD would discard the zero-padding.
     waveform_padded = _pad_or_truncate(waveform)
 
     # ── 2. Run on the selected engine (no silent fallback) ────────────────────────
-    vllm_engine = await _get_engine_async(model) if selected_engine == "vllm" else None
     request_start = time.perf_counter()
 
-    if selected_engine == "vllm":
-        if vllm_engine is not None:
-            transcript, ttft_ms, itl_ms = await _run_vllm(vllm_engine, waveform_padded, model)
+    if selected_engine == "faster_whisper":
+        fw_model = await _get_faster_whisper_async(model)
+        if fw_model is not None:
+            transcript, ttft_ms, itl_ms = await _run_faster_whisper(fw_model, waveform, iso_lang)
         else:
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    f"vLLM engine failed to initialise for '{model}'. "
-                    "On SM 12.0 (Blackwell) all attention backends segfault "
-                    "due to Triton 3.6.0 bug. Select an HF-GPU variant or "
-                    "deploy to a non-Blackwell cloud GPU."
-                ),
+                detail=f"faster-whisper engine failed to load for '{model}'. Check backend logs.",
             )
+    elif selected_engine == "vllm":
+        vllm_engine = await _get_engine_async(model)
+        if vllm_engine is not None:
+            transcript, ttft_ms, itl_ms = await _run_vllm(vllm_engine, waveform_padded, model)
+        else:
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No CUDA GPU detected'
+            compute_cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else ('N/A',)
+            msg = (
+                f"vLLM engine failed to initialise for '{model}'. "
+                f"\nGPU: {gpu_name} (compute capability: {compute_cap})"
+                "\nThis is NOT a Blackwell (SM 12.0) GPU. "
+                "Check backend logs for the actual vLLM error above this message. "
+                "If you see a Triton or CUDA error, report it. Otherwise, this may be a model or vLLM compatibility issue."
+            )
+            raise HTTPException(status_code=503, detail=msg)
     else:
         hf_pipeline = await _get_hf_pipeline_async(model, selected_engine)
         if hf_pipeline is not None:
-            transcript, ttft_ms, itl_ms = await _run_hf_pipeline(hf_pipeline, waveform_padded, iso_lang)
+            transcript, ttft_ms, itl_ms = await _run_hf_pipeline(hf_pipeline, waveform, iso_lang)
         else:
             raise HTTPException(
                 status_code=503,
@@ -803,11 +900,13 @@ async def _run_vllm(
     engine,
     waveform: np.ndarray,
     model_key: str,
+    language: str = "en",
 ) -> tuple[str, float, float]:
     """
     Run vLLM inference; return (transcript, ttft_ms, mean_itl_ms).
 
     Adapts the prompt and multimodal data format per model:
+    - Cohere Transcribe: encoder-decoder with language/pnc control tags + audio
     - Granite Speech: chat-template with <|audio|> token + multi_modal_data
     - Qwen-style: <|audio_bos|><|AUDIO|><|audio_eos|> prompt
     """
@@ -815,9 +914,23 @@ async def _run_vllm(
     from vllm import SamplingParams, TokensPrompt  # type: ignore
 
     hf_model = SUPPORTED_MODELS.get(model_key, model_key)
+    is_cohere = "cohere-transcribe" in hf_model.lower()
     is_granite = "granite" in hf_model.lower() and "speech" in hf_model.lower()
 
-    if is_granite:
+    if is_cohere:
+        # Cohere Transcribe: encoder-decoder with structured control tags
+        lang_tag = f"<|{language}|><|{language}|>"
+        prompt = (
+            f"<|startofcontext|><|startoftranscript|>"
+            f"<|emo:undefined|>{lang_tag}<|pnc|>"
+            f"<|noitn|><|notimestamp|><|nodiarize|>"
+        )
+        sampling_params = SamplingParams(temperature=0.0, max_tokens=512)
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {"audio": (waveform, TARGET_SR)},
+        }
+    elif is_granite:
         # Granite Speech: chat-template prompt + multimodal audio data
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
@@ -1092,30 +1205,42 @@ async def transcribe_stream(
         raise HTTPException(status_code=422, detail=f"Cannot decode audio: {exc}") from exc
 
     audio_duration_s = len(waveform) / TARGET_SR
+    # Only vLLM needs fixed-shape tensors; faster-whisper and HF handle
+    # variable-length input and their VAD would discard the zero-padding.
     waveform_padded = _pad_or_truncate(waveform)
-    vllm_engine = await _get_engine_async(model) if selected_engine == "vllm" else None
-    hf_pipeline = None
-    if selected_engine in {"hf-gpu", "hf-cpu"}:
-        hf_pipeline = await _get_hf_pipeline_async(model, selected_engine)
 
-    if selected_engine == "vllm" and vllm_engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
+    # Pre-load engines based on selected_engine
+    fw_model = None
+    vllm_engine = None
+    hf_pipeline = None
+    if selected_engine == "faster_whisper":
+        fw_model = await _get_faster_whisper_async(model)
+        if fw_model is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"faster-whisper engine failed to load for '{model}'. Check backend logs.",
+            )
+    elif selected_engine == "vllm":
+        vllm_engine = await _get_engine_async(model)
+        if vllm_engine is None:
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No CUDA GPU detected'
+            compute_cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else ('N/A',)
+            msg = (
                 f"vLLM engine failed to initialise for '{model}'. "
-                "On SM 12.0 (Blackwell) all attention backends segfault "
-                "due to Triton 3.6.0 bug. Select an HF-GPU variant or "
-                "deploy to a non-Blackwell cloud GPU."
-            ),
-        )
-    if selected_engine in {"hf-gpu", "hf-cpu"} and hf_pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Transformers engine '{selected_engine}' failed to load for '{model}'. "
-                "Check backend logs for details."
-            ),
-        )
+                f"\nGPU: {gpu_name} (compute capability: {compute_cap})"
+                "\nCheck backend logs for the actual vLLM error above this message."
+            )
+            raise HTTPException(status_code=503, detail=msg)
+    else:
+        hf_pipeline = await _get_hf_pipeline_async(model, selected_engine)
+        if hf_pipeline is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Transformers engine '{selected_engine}' failed to load for '{model}'. "
+                    "Check backend logs for details."
+                ),
+            )
 
     async def event_generator() -> AsyncGenerator[str, None]:
         import json
@@ -1125,13 +1250,51 @@ async def transcribe_stream(
         token_timestamps: list[float] = []
         full_text = ""
 
-        if vllm_engine is not None:
+        if fw_model is not None:
+            # faster-whisper: stream segment-by-segment (use raw waveform,
+            # not padded — VAD would strip the zero-padding and lose speech)
+            def _fw_segments():
+                segs, info = fw_model.model.transcribe(
+                    waveform,
+                    language=iso_lang if iso_lang != "auto" else None,
+                    beam_size=5,
+                    vad_filter=True,
+                )
+                return list(segs)
+
+            segments = await asyncio.to_thread(_fw_segments)
+            for seg in segments:
+                now = time.perf_counter()
+                if first_token_time is None:
+                    first_token_time = now
+                    ttft_ms = (first_token_time - request_start) * 1000
+                    yield f"data: {json.dumps({'token': '', 'ttft_ms': round(ttft_ms, 2), 'done': False})}\n\n"
+                token_timestamps.append(now)
+                delta = seg.text.strip()
+                if delta:
+                    full_text += delta + " "
+                    yield f"data: {json.dumps({'token': delta + ' ', 'ttft_ms': None, 'done': False})}\n\n"
+
+        elif vllm_engine is not None:
             from vllm import SamplingParams  # type: ignore
 
             hf_model = SUPPORTED_MODELS.get(model, model)
+            is_cohere = "cohere-transcribe" in hf_model.lower()
             is_granite = "granite" in hf_model.lower() and "speech" in hf_model.lower()
 
-            if is_granite:
+            if is_cohere:
+                lang_tag = f"<|{iso_lang}|><|{iso_lang}|>"
+                prompt = (
+                    f"<|startofcontext|><|startoftranscript|>"
+                    f"<|emo:undefined|>{lang_tag}<|pnc|>"
+                    f"<|noitn|><|notimestamp|><|nodiarize|>"
+                )
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=512)
+                inputs = {
+                    "prompt": prompt,
+                    "multi_modal_data": {"audio": (waveform_padded, TARGET_SR)},
+                }
+            elif is_granite:
                 from transformers import AutoTokenizer
                 tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
                 question = "can you transcribe the speech into a written format?"
@@ -1163,7 +1326,7 @@ async def transcribe_stream(
                     if delta:
                         yield f"data: {json.dumps({'token': delta, 'ttft_ms': None, 'done': False})}\n\n"
         elif hf_pipeline is not None:
-            transcript, _, _ = await _run_hf_pipeline(hf_pipeline, waveform_padded, iso_lang)
+            transcript, _, _ = await _run_hf_pipeline(hf_pipeline, waveform, iso_lang)
             first_token_time = time.perf_counter()
             ttft_ms = (first_token_time - request_start) * 1000
             token_timestamps.append(first_token_time)
@@ -1172,8 +1335,6 @@ async def transcribe_stream(
             token_timestamps.append(time.perf_counter())
         else:
             # Mock streaming
-            import asyncio
-
             words = (
                 f"[Mock – {model}] Audio {audio_duration_s:.1f}s. "
                 "No GPU available."
@@ -1217,6 +1378,262 @@ async def transcribe_stream(
 
 
 # ---------------------------------------------------------------------------
-# Mount Gradio UI AFTER all FastAPI routes so it doesn't shadow them
+# Async transcription – queue-based (Valkey + worker)
 # ---------------------------------------------------------------------------
-app = gr.mount_gradio_app(app, demo, path="/")
+
+@app.post("/transcribe/async", status_code=202)
+async def transcribe_async(
+    audio: UploadFile = File(..., description="Audio file (wav/mp3/ogg/flac…)"),
+    model: str = Form(..., description="Model key"),
+    engine: str | None = Form(None, description="Execution engine"),
+    language: str = Form("english", description="Language name"),
+    session_id: str = Form("", description="Client session ID for scoping"),
+):
+    """Accept a transcription job and enqueue it for background processing."""
+    job_id = str(uuid.uuid4())
+    SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    audio_filename = f"{job_id}.wav"
+    audio_path = SPOOL_DIR / audio_filename
+
+    # Read and normalise to 16 kHz mono WAV for the worker
+    raw_bytes = await audio.read()
+    waveform, sr = sf.read(io.BytesIO(raw_bytes))
+    if waveform.ndim > 1:
+        waveform = waveform.mean(axis=1)
+    if sr != TARGET_SR:
+        waveform = librosa.resample(waveform, orig_sr=sr, target_sr=TARGET_SR)
+    sf.write(str(audio_path), waveform, TARGET_SR)
+    logger.info("Job %s: audio normalised → spool (%s)", job_id, audio_filename)
+
+    # Convert language name → ISO 639-1 code for faster-whisper
+    iso_lang = LANGUAGE_ISO_MAP.get(language.strip().lower(), language.strip().lower())
+
+    try:
+        rconn = _get_valkey()
+        job_key = f"{JOB_PREFIX}{job_id}"
+        rconn.hset(job_key, mapping={
+            "status": "queued",
+            "audio_file": audio_filename,
+            "original_filename": audio.filename or "unknown",
+            "language": iso_lang,
+            "model": model,
+            "engine": engine or "",
+            "session_id": session_id,
+            "created_at": str(time.time()),
+            "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        })
+        rconn.expire(job_key, 86400)  # TTL 24 hours
+        rconn.lpush(QUEUE_KEY, job_id)
+    except redis.ConnectionError as exc:
+        audio_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    logger.info("Job %s queued (model=%s, lang=%s)", job_id, model, language)
+    return {"job_id": job_id, "status": "accepted"}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Poll the status of an async transcription job."""
+    try:
+        rconn = _get_valkey()
+        data = rconn.hgetall(f"{JOB_PREFIX}{job_id}")
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    if not data:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    logger.debug("Job %s polled — status=%s", job_id, data.get("status", "unknown"))
+    return data
+
+
+@app.get("/jobs")
+async def list_jobs(session_id: str = ""):
+    """List jobs, optionally filtered by session_id."""
+    try:
+        rconn = _get_valkey()
+        keys = rconn.keys(f"{JOB_PREFIX}*")
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    if not keys:
+        return {"jobs": {}}
+
+    # Pipeline HGETALL for all keys in a single round-trip
+    pipe = rconn.pipeline(transaction=False)
+    for key in keys:
+        pipe.hgetall(key)
+    results = pipe.execute()
+
+    jobs = {}
+    for key, data in zip(keys, results):
+        if not data:
+            continue
+        if session_id and data.get("session_id", "") != session_id:
+            continue
+        job_id = key.removeprefix(JOB_PREFIX)
+        jobs[job_id] = data
+    return {"jobs": jobs}
+
+
+@app.post("/transcribe/batch", status_code=202)
+async def batch_transcribe(
+    files: list[UploadFile] = File(..., description="One or more audio files"),
+    model: str = Form(..., description="Model key"),
+    engine: str | None = Form(None, description="Execution engine"),
+    language: str = Form("english", description="Language name"),
+    session_id: str = Form("", description="Client session ID for scoping"),
+):
+    """Accept multiple audio files and enqueue each for background processing."""
+    iso_lang = LANGUAGE_ISO_MAP.get(language.strip().lower(), language.strip().lower())
+    SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        rconn = _get_valkey()
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    created_jobs = []
+    for upload in files:
+        job_id = str(uuid.uuid4())
+        audio_filename = f"{job_id}.wav"
+        audio_path = SPOOL_DIR / audio_filename
+
+        raw_bytes = await upload.read()
+        waveform, sr = sf.read(io.BytesIO(raw_bytes))
+        if waveform.ndim > 1:
+            waveform = waveform.mean(axis=1)
+        if sr != TARGET_SR:
+            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=TARGET_SR)
+        sf.write(str(audio_path), waveform, TARGET_SR)
+
+        job_key = f"{JOB_PREFIX}{job_id}"
+        rconn.hset(job_key, mapping={
+            "status": "queued",
+            "audio_file": audio_filename,
+            "original_filename": upload.filename or "unknown",
+            "language": iso_lang,
+            "model": model,
+            "engine": engine or "",
+            "session_id": session_id,
+            "created_at": str(time.time()),
+            "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        })
+        rconn.expire(job_key, 86400)  # TTL 24 hours
+        rconn.lpush(QUEUE_KEY, job_id)
+        created_jobs.append({"id": job_id, "filename": upload.filename or "unknown"})
+        logger.info("Batch job %s queued (file=%s, model=%s)", job_id, upload.filename, model)
+
+    logger.info("Batch enqueue complete: %d jobs queued (session=%s)", len(created_jobs), session_id[:8] if session_id else "none")
+    return {"jobs": created_jobs}
+
+
+@app.delete("/jobs")
+async def delete_all_jobs(session_id: str = ""):
+    """Delete all jobs, optionally scoped by session_id."""
+    try:
+        rconn = _get_valkey()
+        keys = rconn.keys(f"{JOB_PREFIX}*")
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    deleted = 0
+    for key in keys:
+        data = rconn.hgetall(key)
+        if not data:
+            continue
+        if session_id and data.get("session_id", "") != session_id:
+            continue
+        rconn.delete(key)
+        audio_file = data.get("audio_file", "")
+        if audio_file:
+            (SPOOL_DIR / Path(audio_file).name).unlink(missing_ok=True)
+        deleted += 1
+
+    # Sweep orphaned spool files (no matching Valkey record)
+    orphans = 0
+    remaining_ids = set()
+    for key in rconn.keys(f"{JOB_PREFIX}*"):
+        data = rconn.hgetall(key)
+        af = data.get("audio_file", "") if data else ""
+        if af:
+            remaining_ids.add(Path(af).name)
+    for f in SPOOL_DIR.glob("*.wav"):
+        if f.name not in remaining_ids:
+            f.unlink(missing_ok=True)
+            orphans += 1
+
+    logger.info("Deleted %d jobs, %d orphaned files (session_id=%s)", deleted, orphans, session_id or "*")
+    return {"deleted": deleted, "orphans_removed": orphans}
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a job and its audio file."""
+    try:
+        rconn = _get_valkey()
+        job_key = f"{JOB_PREFIX}{job_id}"
+        data = rconn.hgetall(job_key)
+        if not data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        rconn.delete(job_key)
+        # Remove spool audio file
+        audio_file = data.get("audio_file", "")
+        if audio_file:
+            (SPOOL_DIR / Path(audio_file).name).unlink(missing_ok=True)
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+    logger.info("Job %s deleted", job_id)
+    return {"status": "deleted"}
+
+
+@app.post("/jobs/{job_id}/resubmit", status_code=202)
+async def resubmit_job(job_id: str):
+    """Re-submit a job using its existing spool audio file."""
+    try:
+        rconn = _get_valkey()
+        old_key = f"{JOB_PREFIX}{job_id}"
+        old_data = rconn.hgetall(old_key)
+        if not old_data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        audio_file = old_data.get("audio_file", "")
+        if not audio_file or not (SPOOL_DIR / Path(audio_file).name).is_file():
+            raise HTTPException(status_code=410, detail="Audio file no longer available")
+
+        new_id = str(uuid.uuid4())
+        new_audio = f"{new_id}.wav"
+        # Hard-link (no copy) the original audio to avoid duplicating data
+        import shutil
+        shutil.copy2(str(SPOOL_DIR / Path(audio_file).name), str(SPOOL_DIR / new_audio))
+
+        new_key = f"{JOB_PREFIX}{new_id}"
+        rconn.hset(new_key, mapping={
+            "status": "queued",
+            "audio_file": new_audio,
+            "original_filename": old_data.get("original_filename", "unknown"),
+            "language": old_data.get("language", "en"),
+            "model": old_data.get("model", ""),
+            "engine": old_data.get("engine", ""),
+            "session_id": old_data.get("session_id", ""),
+            "created_at": str(time.time()),
+            "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        })
+        rconn.expire(new_key, 86400)  # TTL 24 hours
+        rconn.lpush(QUEUE_KEY, new_id)
+    except redis.ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}")
+
+    logger.info("Job %s resubmitted as %s", job_id, new_id)
+    return {"job_id": new_id, "status": "accepted"}
+
+
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str):
+    """Serve audio from the spool directory for browser playback."""
+    # Sanitise: strip path traversal attempts
+    safe_name = Path(filename).name
+    audio_path = SPOOL_DIR / safe_name
+    if not audio_path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(str(audio_path), media_type="audio/wav")

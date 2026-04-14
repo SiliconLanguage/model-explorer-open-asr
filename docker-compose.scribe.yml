@@ -1,0 +1,122 @@
+# ── Scribe v1: Full-Stack Docker Compose ─────────────────────────────────────
+# Usage:
+#   docker compose -f docker-compose.scribe.yml up --build
+#
+# Override Valkey endpoint for AWS:
+#   VALKEY_ENDPOINT=clustercfg.asr-demo-valkey.cynhkp.usw2.cache.amazonaws.com:6379 \
+#     docker compose -f docker-compose.scribe.yml up --build
+#
+# For local dev without AWS, the bundled Valkey container is used.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Go/Gin Ingestion Gateway ────────────────────────────────────────────
+  gateway:
+    build:
+      context: ./scribe
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      WORKER_ENDPOINT: worker:50051
+      VALKEY_ENDPOINT: ${VALKEY_ENDPOINT:-valkey:6379}
+      NORMALIZER_ENDPOINT: normalizer:9090
+      LISTEN_ADDR: ":8080"
+    depends_on:
+      worker:
+        condition: service_started
+      normalizer:
+        condition: service_started
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Rust Audio Normalizer Sidecar ───────────────────────────────────────
+  normalizer:
+    build:
+      context: ./scribe/normalizer
+      dockerfile: Dockerfile
+    ports:
+      - "9090:9090"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Python Inference Worker (gRPC Server) ───────────────────────────────
+  worker:
+    build:
+      context: ./scribe
+      dockerfile: worker/Dockerfile
+    command: ["python3", "scribe_server.py"]
+    ports:
+      - "50051:50051"
+    environment:
+      GRPC_PORT: "50051"
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-large-v3}
+      DEVICE: ${DEVICE:-auto}
+      COMPUTE_TYPE: ${COMPUTE_TYPE:-auto}
+      VALKEY_ENDPOINT: ${VALKEY_ENDPOINT:-valkey:6379}
+    volumes:
+      - model-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Batch Consumer (processes queued jobs from Valkey) ───────────────────
+  batch-consumer:
+    build:
+      context: ./scribe
+      dockerfile: worker/Dockerfile
+    command: ["python3", "batch_consumer.py"]
+    environment:
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-large-v3}
+      DEVICE: ${DEVICE:-auto}
+      COMPUTE_TYPE: ${COMPUTE_TYPE:-auto}
+      VALKEY_ENDPOINT: ${VALKEY_ENDPOINT:-valkey:6379}
+      CONSUMER_GROUP: scribe-workers
+      CONSUMER_NAME: consumer-1
+    volumes:
+      - model-cache:/root/.cache
+    depends_on:
+      valkey:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Valkey (local dev — skip if using AWS Valkey) ───────────────────────
+  valkey:
+    image: valkey/valkey:8.1
+    ports:
+      - "6379:6379"
+    command: >
+      valkey-server
+        --save 60 1000
+        --loglevel notice
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  model-cache:
+  valkey-data:

@@ -123,18 +123,21 @@ async function loadModel(modelId) {
     }
 
     self.postMessage({ type: 'loading', modelId });
-    // Cohere 2B encoder fp16 has 2 external data shards (~2.5 GB) which
-    // exceeds browser memory limits.  Use q4f16 (1 shard, ~600 MB) instead.
+    // Dtype selection:
+    // - Cohere 2B: q4 (int4 MatMulNBits).  fp16 has 2.5 GB shards that
+    //   exceed browser memory; q4f16 uses GatherBlockQuantized which needs
+    //   shader-f16 and crashes on most GPUs.
+    // - Whisper:    fp16 (small models, ~60-120 MB, widely supported).
     const isCohere = modelId.toLowerCase().includes('cohere');
-    const gpuDtype = isCohere ? 'q4f16' : 'fp16';
+    const gpuDtype = isCohere ? 'q4' : 'fp16';
     try {
       asr = await pipeline('automatic-speech-recognition', modelId, {
         device: 'webgpu',
         dtype: gpuDtype,
       });
     } catch {
-      // WebGPU unavailable (non-secure context, old browser, no GPU) –
-      // fall back to WASM fp32 so the app still works.
+      // WebGPU unavailable (non-secure context / HTTP, old browser, no
+      // GPU, or unsupported ONNX ops) — fall back to WASM.
       self.postMessage({ type: 'loading', modelId, fallback: 'wasm' });
       asr = await pipeline('automatic-speech-recognition', modelId, {
         device: 'wasm',

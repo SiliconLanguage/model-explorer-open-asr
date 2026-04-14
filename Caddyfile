@@ -1,0 +1,10 @@
+asr-demo.siliconlanguage.com {
+    # 1. Route specific API and backend paths to FastAPI (Port 8000)
+    @api {
+        path /aiservices/* /jobs /jobs/* /models /transcribe* /docs /openapi.json /health /audio/*
+    }
+    reverse_proxy @api backend:8000
+
+    # 2. Route everything else to the React/Vite UI (internal port 80)
+    reverse_proxy frontend:80
+}

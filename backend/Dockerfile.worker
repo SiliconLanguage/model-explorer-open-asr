@@ -1,0 +1,42 @@
+# ── Worker image: CUDA 12.8 + cuDNN for faster-whisper / VibeVoice-ASR ───────
+# Separate from the backend Dockerfile to avoid the vllm↔transformers>=5.3
+# dependency conflict.  The worker never imports vllm.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+LABEL maintainer="Open-ASR Model Explorer"
+LABEL description="Background ASR worker (faster-whisper / VibeVoice-ASR)"
+
+# ── System dependencies ───────────────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3-pip \
+    libsndfile1 \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+# ── Install worker-specific Python dependencies ──────────────────────────────
+COPY requirements-worker.txt .
+RUN /opt/venv/bin/pip install --no-cache-dir --upgrade "pip<26" \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements-worker.txt
+
+# ── Copy worker source ───────────────────────────────────────────────────────
+COPY worker.py .
+
+# ── Runtime environment ──────────────────────────────────────────────────────
+ENV HF_HOME=/hf_cache
+ENV TRANSFORMERS_CACHE=/hf_cache
+
+CMD ["python", "worker.py"]
