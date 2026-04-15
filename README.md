@@ -18,6 +18,8 @@ pinned: false
 
 A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qwen3-ASR, IBM Granite) featuring vLLM server-side routing and transformers.js WebGPU client-side inference.
 
+![Open-ASR Model Explorer UI](docs/screenshots/ui-overview.png)
+
 ## Quick Start
 
 ### 1) Environment Setup
