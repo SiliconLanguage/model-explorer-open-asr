@@ -14,9 +14,9 @@ pinned: false
 [![Python](https://img.shields.io/badge/Python-3.11-blue?style=for-the-badge&logo=python)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.120-green?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react)](https://react.dev)
-[![vLLM](https://img.shields.io/badge/vLLM-0.19-purple?style=for-the-badge)](https://vllm.ai)
+[![faster-whisper](https://img.shields.io/badge/faster--whisper-CTranslate2-purple?style=for-the-badge)](https://github.com/SYSTRAN/faster-whisper)
 
-A hybrid inference testbed for evaluating top open-source ASR models (Cohere, Qwen3-ASR, IBM Granite) featuring vLLM server-side routing and transformers.js WebGPU client-side inference.
+A hybrid ASR testbed for evaluating open-source speech recognition models (Whisper, Cohere Transcribe, Qwen3-ASR, IBM Granite) with server-side faster-whisper inference via an async Valkey queue and client-side WebGPU inference via transformers.js.
 
 ![Open-ASR Model Explorer UI](docs/screenshots/ui-overview.png)
 
@@ -153,7 +153,7 @@ To replay a saved drawing in MCP chat, copy the `elements` array from one of the
 | `openai/whisper-base` | **Server (HF-GPU / HF-CPU)** | Standard HF transformers pipeline |
 | `CohereLabs/cohere-transcribe-03-2026` | **Server (HF-GPU / HF-CPU)** | Custom model wrapper (`trust_remote_code`) |
 | `Qwen3-ASR-1.7B` | **Server (HF-GPU)** | Via `qwen-asr` package (architecture not in transformers) |
-| `ibm-granite/granite-4.0-1b-speech` | **Server (HF-GPU / vLLM Cloud)** | Chat-template + `<\|audio\|>` multimodal wrapper |
+| `ibm-granite/granite-4.0-1b-speech` | **Server (HF-GPU)** | Chat-template + `<\|audio\|>` multimodal wrapper |
 | `Xenova/whisper-tiny` / `Xenova/whisper-base` | **Client (WebGPU)** | Runs in-browser via transformers.js ONNX |
 | `onnx-community/cohere-transcribe-03-2026-ONNX` | **Client (WebGPU)** | Cohere in-browser via transformers.js ONNX |
 
@@ -162,22 +162,18 @@ To replay a saved drawing in MCP chat, copy the `elements` array from one of the
 - **Persistent ONNX cache** – model weights cached via the browser Cache API
 - **LocalAgreement-2 streaming** – unconfirmed partial hypotheses are held back until two consecutive passes agree on a prefix
 
-### Backend vLLM Configuration
-- **Chunked Prefill** – `enable_chunked_prefill=True` prevents long audio prefills from starving decode steps
-- **Pre-batching normalisation** – all audio padded/truncated to 30 s before entering the scheduler
-- **Resource constraints** – `max_num_batched_tokens=512`, env-driven `gpu_memory_utilization`, auto-derived `max_model_len`
+### Backend Inference Configuration
+- **faster-whisper (CTranslate2)** – quantized INT8 inference, up to 4× faster than native PyTorch Whisper
+- **Pre-batching normalisation** – all audio normalised to 16 kHz mono WAV before entering the worker
+- **Resource constraints** – configurable `NUM_WORKERS`, `WHISPER_MODEL`, and `GPU_MEMORY_UTILIZATION` via environment
 
-### Hardware Constraints: vLLM on SM 12.0 (Blackwell)
+### Hardware Notes: SM 12.0 (Blackwell) GPUs
 
 > **Affects:** Local development on NVIDIA RTX 5070 Ti and other SM 12.0 (Blackwell) GPUs.
 
-**The Issue.** While vLLM 0.19.0 is the target production engine, running it locally on SM 12.0 hardware fails due to an upstream `ir.builder` NULL-dereference bug in the bundled Triton 3.6.0 compiler. This crashes all native attention kernels — FlashAttention 2, FlashInfer 0.6.6, and every Triton-based backend (TRITON_ATTN, FLEX_ATTENTION). The NVFP4 kernel guard patches in vLLM 0.19.0 (PR #38423, #38126) address quantization paths but do not fix the attention backend segfaults.
+The faster-whisper worker uses CTranslate2 with native CUDA kernels and runs reliably on all CUDA 12.x hardware including SM 12.0 Blackwell. No Triton compiler dependency is involved.
 
-**Graceful Degradation.** The testbed handles this without crashing. When a vLLM route is requested on unsupported local hardware, the backend returns `503 Service Unavailable` with a descriptive message. Users should select an **HF-GPU** variant from the model dropdown to process audio via the standard Hugging Face transformers pipeline, which uses native PyTorch CUDA primitives and runs reliably on SM 12.0.
-
-**Future Resolution.** Once Triton ≥ 3.6.1 ships with the `ir.builder` fix and is bundled into a future vLLM release, the local SM 12.0 constraint will be lifted and vLLM will serve as the primary engine on all hardware.
-
-For the full architectural decision record, see [ADR-001: vLLM vs. Hugging Face Inference Routing](https://github.com/SiliconLanguage/model-explorer-open-asr-AgentWiki/blob/main/Architecture/ADR-001-vLLM_Constraints.md).
+For the architectural decision record on engine selection, see [ADR-001: Migrate ASR Inference from vLLM to faster-whisper](docs/adr/ADR-001-migrate-asr-inference-from-vllm-to-faster-whisper.md).
 
 ---
 
@@ -241,7 +237,7 @@ model-explorer-open-asr/
 ### Prerequisites
 - Node.js ≥ 18
 - Python 3.11
-- (Optional) NVIDIA GPU with CUDA 12.1 for vLLM inference
+- (Optional) NVIDIA GPU with CUDA 12.x for server-side faster-whisper inference
 
 ### Backend
 
