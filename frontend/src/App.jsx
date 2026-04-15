@@ -433,7 +433,10 @@ export default function App() {
       <header className="app-header">
         <div className="header-title-row">
           <span className="header-icon">🎙</span>
-          <h1 className="header-title">SiliconLanguage Open-ASR Model Explorer</h1>
+          <h1 className="header-title">
+            <img src="/logo-lockup.png" alt="Silicon Language" className="header-brand-logo" />
+            <span>Open-ASR Model Explorer</span>
+          </h1>
         </div>
         <p className="header-subtitle">
           High-Throughput Asynchronous ASR Pipeline · FastAPI &amp; Valkey Event-Driven Inference
@@ -563,7 +566,7 @@ export default function App() {
             <img src="/logo-lockup.png" alt="Silicon Language" className="footer-logo" />
           </a>
           <p>
-            SiliconLanguage Open-ASR Model Explorer · Decoupled Queue-Driven Processing
+            Open-ASR Model Explorer · Decoupled Queue-Driven Processing
           </p>
         </div>
       </footer>

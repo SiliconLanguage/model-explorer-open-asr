@@ -8,7 +8,7 @@ import { test, expect } from '@playwright/test';
 // ---------------------------------------------------------------------------
 test('WebGPU English & Singleton Speed @dev', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Open-ASR Model Explorer' })).toBeVisible();
+  await expect(page.locator('h1.header-title')).toBeVisible();
 
   // Select Whisper Base WebGPU
   await page.locator('#model-select').selectOption('whisper-base-webgpu');
@@ -61,7 +61,7 @@ test('Server-Side Multilingual Chinese @dev', async ({ page }) => {
   });
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Open-ASR Model Explorer' })).toBeVisible();
+  await expect(page.locator('h1.header-title')).toBeVisible();
 
   // Select server-side Whisper Base HF-GPU
   await page.locator('#model-select').selectOption('whisper-base-hf-gpu');
@@ -128,7 +128,7 @@ test('Upload >1 MB audio file does not 413 @dev', async ({ page }) => {
   // Remaining bytes are already 0 (silence) — good enough for this test.
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Open-ASR Model Explorer' })).toBeVisible();
+  await expect(page.locator('h1.header-title')).toBeVisible();
 
   // Select Whisper Base HF-GPU (fast to load, reliable)
   await page.locator('#model-select').selectOption('whisper-base-hf-gpu');
@@ -188,7 +188,7 @@ test('Upload >1 MB audio file does not 413 @dev', async ({ page }) => {
 // ---------------------------------------------------------------------------
 test('Cohere WebGPU English Transcript Completeness', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Open-ASR Model Explorer' })).toBeVisible();
+  await expect(page.locator('h1.header-title')).toBeVisible();
 
   // Select Cohere WebGPU
   await page.locator('#model-select').selectOption('cohere-webgpu');
